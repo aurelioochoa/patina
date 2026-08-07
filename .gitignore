@@ -1,0 +1,15 @@
+# Runtime state — contains conversation-derived content. Never commit.
+# These normally live in ~/.claude/self-improve/, outside this tree entirely;
+# these rules exist only as a backstop against a stray copy or symlink.
+state.json
+audit.jsonl
+*.log
+.locks/
+
+# Test fixtures built from real transcripts
+tests/fixtures/real/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
