@@ -37,10 +37,20 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 HOME = Path.home()
-CLAUDE_DIR = HOME / ".claude"
-SKILLS_DIR = CLAUDE_DIR / "skills"
-PROJECTS_DIR = CLAUDE_DIR / "projects"
-STATE_DIR = CLAUDE_DIR / "self-improve"
+# install.sh honours the same variable; the two must agree or the installer
+# would wire hooks to a tree the scripts never look at.
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
+# Write targets are independently overridable. This is what makes a real
+# end-to-end rehearsal possible: point these at a scratch tree while
+# CLAUDE_CONFIG_DIR stays on the real config, so the fork authenticates
+# normally but cannot touch the live skill library.
+SKILLS_DIR = Path(os.environ.get("CLAUDE_SELF_IMPROVE_SKILLS_DIR") or (CLAUDE_DIR / "skills"))
+PROJECTS_DIR = Path(
+    os.environ.get("CLAUDE_SELF_IMPROVE_PROJECTS_DIR") or (CLAUDE_DIR / "projects")
+)
+STATE_DIR = Path(
+    os.environ.get("CLAUDE_SELF_IMPROVE_STATE_DIR") or (CLAUDE_DIR / "self-improve")
+)
 LOCK_DIR = STATE_DIR / ".locks"
 
 #: Env sentinel. Set on every child; both hook entry points exit if they see it.

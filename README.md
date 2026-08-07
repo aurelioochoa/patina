@@ -9,8 +9,79 @@ reviews finished sessions and writes what it learned into your skill library and
 
 ## Status
 
-**Design approved, not yet implemented.** See
-[the spec](docs/superpowers/specs/2026-08-07-claude-self-improvement-loop-design.md).
+**Code complete, not yet activated.** 95 tests pass. One live end-to-end run was
+attempted and blocked by an account session limit, so the loop has never
+actually written a skill. Hooks are deliberately unregistered until it has.
+
+See [the spec](docs/superpowers/specs/2026-08-07-claude-self-improvement-loop-design.md).
+
+## Install
+
+```sh
+./install.sh                  # copy scripts to ~/.claude/self-improve, init audit repo
+```
+
+This does **not** activate anything. Verify by hand first:
+
+```sh
+# 1. Dry run -- builds the prompt, forks nothing
+python3 ~/.claude/self-improve/review.py \
+    --transcript ~/.claude/projects/<slug>/<session>.jsonl --dry-run
+
+# 2. Rehearsal with real auth but redirected writes, so the live
+#    skill library cannot be touched
+export CLAUDE_SELF_IMPROVE_SKILLS_DIR=/tmp/rehearsal/skills
+export CLAUDE_SELF_IMPROVE_STATE_DIR=/tmp/rehearsal/state
+python3 ~/.claude/self-improve/review.py --transcript <transcript>
+git -C /tmp/rehearsal/skills log -p
+
+# 3. Only once that looks right
+./install.sh --register-hooks
+```
+
+`./install.sh --uninstall` removes the scripts and hooks and leaves your skills
+and their git history alone.
+
+## Operating it
+
+```sh
+review.py  --status          # runs, no-op rate, allowlist violations
+curator.py --status          # interval, pending sweep, run count
+curator.py --run             # run the curator now, ignoring the interval
+curator.py --pause           # stop the loop without uninstalling
+git -C ~/.claude/skills log  # everything it has ever written
+```
+
+If `--status` shows every review as a no-op, the prompt is not reaching the
+model — that is the failure this reporting exists to catch.
+
+## Adopting a skill
+
+The loop only writes to skills carrying the marker. To hand one over:
+
+```yaml
+---
+name: my-skill
+description: ...
+metadata:
+  autoManaged: true
+---
+```
+
+Remove the marker to take it back.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLAUDE_SELF_IMPROVE_MODEL` | `sonnet` | model for both review and curator |
+| `CLAUDE_SELF_IMPROVE_TIMEOUT` | `600` | per-review timeout, seconds |
+| `CLAUDE_SELF_IMPROVE_CURATOR_TIMEOUT` | `900` | curator timeout, seconds |
+| `CLAUDE_SELF_IMPROVE_SKILLS_DIR` | `~/.claude/skills` | redirect writes (rehearsal) |
+| `CLAUDE_SELF_IMPROVE_STATE_DIR` | `~/.claude/self-improve` | redirect state |
+| `CLAUDE_SELF_IMPROVE_PROJECTS_DIR` | `~/.claude/projects` | redirect transcript discovery |
+
+Curator interval lives in `state.json` as `interval_hours` (default 168).
 
 ## How it works
 

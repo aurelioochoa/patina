@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Install the self-improvement loop into ~/.claude.
+#
+# Copies scripts to ~/.claude/self-improve/ and initialises the local audit
+# repo. Does NOT register hooks -- that is a separate, deliberate step, because
+# a broken SessionStart hook fires on every session and you would be debugging
+# it inside the tool it is breaking. Run --register-hooks only once the manual
+# checks below pass.
+#
+#   ./install.sh                  # install scripts, init audit repo
+#   ./install.sh --register-hooks # wire into settings.json (do this last)
+#   ./install.sh --uninstall      # remove scripts and hooks, keep skills
+set -euo pipefail
+
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+TARGET="$CLAUDE_DIR/self-improve"
+SETTINGS="$CLAUDE_DIR/settings.json"
+SKILLS="$CLAUDE_DIR/skills"
+
+info()  { printf '  %s\n' "$*"; }
+ok()    { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn()  { printf '  \033[33m!\033[0m %s\n' "$*"; }
+die()   { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+
+install_scripts() {
+  echo "Installing to $TARGET"
+  command -v claude >/dev/null || die "claude not found on PATH"
+  command -v git    >/dev/null || die "git not found on PATH"
+  command -v python3 >/dev/null || die "python3 not found on PATH"
+
+  mkdir -p "$TARGET/prompts"
+  cp "$SOURCE_DIR"/src/*.py "$TARGET/"
+  cp "$SOURCE_DIR"/src/prompts/*.md "$TARGET/prompts/"
+  chmod +x "$TARGET/review.py" "$TARGET/curator.py"
+  ok "scripts installed"
+
+  mkdir -p "$SKILLS"
+  if [ -d "$SKILLS/.git" ]; then
+    ok "audit repo already initialised"
+  else
+    git -C "$SKILLS" init -q
+    git -C "$SKILLS" config user.name  "claude-self-improve"
+    git -C "$SKILLS" config user.email "self-improve@localhost"
+    git -C "$SKILLS" add -A
+    git -C "$SKILLS" commit -q --allow-empty -m "Baseline before autonomous writes"
+    ok "audit repo initialised at $SKILLS"
+  fi
+
+  # Runtime state lives here, deliberately outside the source tree so it can
+  # never be committed to the public repo.
+  mkdir -p "$CLAUDE_DIR/self-improve/.locks"
+  ok "state directory ready"
+
+  cat <<EOF
+
+Installed, but NOT yet active. Verify by hand before registering hooks:
+
+  1. Dry run against a past session (forks nothing):
+       python3 $TARGET/review.py --transcript <a-transcript.jsonl> --dry-run
+
+  2. One real run, then inspect what it did:
+       python3 $TARGET/review.py --transcript <a-transcript.jsonl>
+       git -C $SKILLS log -p
+       python3 $TARGET/review.py --status
+
+  3. Only then:
+       ./install.sh --register-hooks
+
+Find transcripts under: $CLAUDE_DIR/projects/<project-slug>/*.jsonl
+EOF
+}
+
+register_hooks() {
+  [ -f "$SETTINGS" ] || die "no settings.json at $SETTINGS"
+  [ -x "$TARGET/review.py" ] || die "run ./install.sh first"
+
+  cp "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d_%H%M%S)"
+  ok "backed up settings.json"
+
+  python3 - "$SETTINGS" "$TARGET" <<'PY'
+import json, sys
+settings_path, target = sys.argv[1], sys.argv[2]
+with open(settings_path) as fh:
+    settings = json.load(fh)
+
+hooks = settings.setdefault("hooks", {})
+
+def ensure(event, command, extra=None):
+    entry = {"type": "command", "command": command, "timeout": 30}
+    if extra:
+        entry.update(extra)
+    matchers = hooks.setdefault(event, [])
+    for matcher in matchers:
+        for hook in matcher.get("hooks", []):
+            if "self-improve" in str(hook.get("command", "")):
+                hook.clear()
+                hook.update(entry)
+                return f"updated {event}"
+    matchers.append({"hooks": [entry]})
+    return f"added {event}"
+
+# async so neither hook ever holds up the user's session.
+print(ensure("SessionEnd", f"python3 {target}/review.py", {"async": True}))
+print(ensure("SessionStart", f"python3 {target}/curator.py --check"))
+
+with open(settings_path, "w") as fh:
+    json.dump(settings, fh, indent=2)
+    fh.write("\n")
+PY
+
+  python3 -c "import json;json.load(open('$SETTINGS'))" || die "settings.json is now invalid — restore the .bak"
+  ok "hooks registered and settings.json still parses"
+  info "Start a new session and end it, then: python3 $TARGET/review.py --status"
+}
+
+uninstall() {
+  if [ -f "$SETTINGS" ]; then
+    cp "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d_%H%M%S)"
+    python3 - "$SETTINGS" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as fh:
+    settings = json.load(fh)
+for event, matchers in list(settings.get("hooks", {}).items()):
+    if not isinstance(matchers, list):
+        continue
+    for matcher in matchers:
+        matcher["hooks"] = [
+            h for h in matcher.get("hooks", [])
+            if "self-improve" not in str(h.get("command", ""))
+        ]
+    settings["hooks"][event] = [m for m in matchers if m.get("hooks")]
+    if not settings["hooks"][event]:
+        del settings["hooks"][event]
+with open(path, "w") as fh:
+    json.dump(settings, fh, indent=2)
+    fh.write("\n")
+PY
+    ok "hooks removed"
+  fi
+  rm -rf "$TARGET"
+  ok "scripts removed"
+  warn "left alone: $SKILLS (your skills and their git history)"
+}
+
+case "${1:-}" in
+  --register-hooks) register_hooks ;;
+  --uninstall)      uninstall ;;
+  "")               install_scripts ;;
+  *)                die "unknown option: $1" ;;
+esac

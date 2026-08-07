@@ -233,6 +233,27 @@ the tool it is breaking.
 5. `install.sh` — copy or symlink into `~/.claude/self-improve/`
 6. Register hooks in `~/.claude/settings.json`
 
+## Implementation notes (added during build)
+
+Three things the design did not anticipate, discovered while building:
+
+- **Redirectable write targets are necessary, not a convenience.**
+  `CLAUDE_SELF_IMPROVE_SKILLS_DIR` / `_STATE_DIR` / `_PROJECTS_DIR` exist because
+  sandboxing a rehearsal via `CLAUDE_CONFIG_DIR` alone breaks authentication --
+  credentials live in the real config directory, so the fork fails with
+  "Not logged in". Redirecting only the write targets lets a rehearsal use real
+  auth while being unable to touch the live library.
+
+- **`git status` must be run with `-uall`.** Without it git collapses an
+  untracked directory to `sneaky/`, the per-file allowlist check never sees the
+  `SKILL.md` inside, and a brand-new unmarked skill slips through.
+
+- **Slash-command plumbing has to be stripped from the digest.** Transcripts
+  contain `<local-command-caveat>` blocks whose text instructs the reader to
+  ignore the surrounding message. Feeding that to a review fork is asking for
+  confusion. `digest.clean` removes them and compacts `<command-name>` to
+  `[ran /foo]`.
+
 ## Accepted risks
 
 This loop writes to the skill library autonomously, and Sonnet's judgment about what is worth
