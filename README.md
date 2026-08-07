@@ -42,6 +42,48 @@ git -C /tmp/rehearsal/skills log -p
 `./install.sh --uninstall` removes the scripts and hooks and leaves your skills
 and their git history alone.
 
+## Nothing goes live unreviewed
+
+The review fork writes into a **scratch copy** of your skill library, never the
+real one. It is not told where the real library is. Afterwards, every difference
+is filed as a pending entry for you to approve or reject.
+
+```sh
+pending.py list                 # what the loop wants to change
+pending.py show <id>            # full text for new skills, a diff for patches
+pending.py approve <id>         # apply it and trust the skill from now on
+pending.py reject <id>          # discard it; the loop won't re-propose it
+pending.py approve --all
+```
+
+This covers patches too, not just new skills — patching is the loop's most
+common action, and a patch that skipped review could smuggle bad content into a
+skill you already trust.
+
+Why quarantine rather than only prompting at use time: **a skill's name and
+description are injected into the system prompt every session, whether or not it
+is ever invoked.** A bad skill sitting in the library costs context and biases
+behaviour without the `Skill` tool ever firing. Gating invocation cannot fix
+that; keeping it out of the library can.
+
+### The use-time backstop
+
+`skillgate.py` runs as a `PreToolUse` hook on the `Skill` tool and refuses
+auto-created skills you have not blessed. Quarantine means it normally has
+nothing to do; it exists for the paths quarantine misses — a skill approved once
+and later edited by hand, an entry restored from git.
+
+| State | Behaviour |
+|---|---|
+| `always` | allow, never ask again |
+| `never` | deny, never ask again |
+| session | allow for this session only |
+| unset | ask |
+
+Hand-written skills (no `autoManaged` marker) and plugin skills are never gated.
+If the gate itself errors, it allows — a bug in it must not lock you out of your
+own skills.
+
 ## Operating it
 
 ```sh

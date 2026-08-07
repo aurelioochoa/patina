@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import digest as digest_mod  # noqa: E402
 import guard  # noqa: E402
+import pending  # noqa: E402
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 AUDIT_LOG = guard.STATE_DIR / "audit.jsonl"
@@ -97,8 +98,11 @@ def describe_writable() -> str:
 def build_prompt(digest_text: str, cwd: str, session_id: str) -> str:
     template = (PROMPTS_DIR / "review.md").read_text(encoding="utf-8")
     return (
+        # The fork is pointed at the scratch copy, never the live library. It is
+        # told so explicitly: a skill author who thinks their edit ships
+        # immediately writes differently from one who knows it faces review.
         template.replace("{memory_dir}", str(guard.memory_dir(cwd)))
-        .replace("{skills_dir}", str(guard.SKILLS_DIR))
+        .replace("{skills_dir}", str(guard.WORK_DIR))
         .replace("{writable_skills}", describe_writable())
         .replace("{session_id}", session_id or "unknown")
         .replace("{today}", dt.date.today().isoformat())
@@ -107,30 +111,52 @@ def build_prompt(digest_text: str, cwd: str, session_id: str) -> str:
 
 
 _CREATED_FROM = re.compile(r"^(\s*createdFrom:).*$", re.MULTILINE)
+_METADATA_LINE = re.compile(r"^metadata:\s*$", re.MULTILINE)
+_FRONTMATTER_OPEN = re.compile(r"\A---\r?\n")
 
 
-def stamp_provenance(session_id: str) -> None:
-    """Overwrite ``createdFrom`` with the real session id.
+def normalize_new_skills(session_id: str) -> None:
+    """Force the ownership marker and real session id onto newly written skills.
 
-    Asked to record the session id, the model writes a plausible-looking label
-    of its own instead ("kidtopiaplay-2026-07-launch"). That silently breaks the
-    one link from a bad skill back to the session that produced it, so correct
-    it here rather than trusting the prompt.
+    Two corrections, both because the prompt cannot be trusted to be followed:
+
+    - ``createdFrom``: asked for the session id, the model writes a plausible
+      label of its own ("kidtopiaplay-2026-07-launch"), breaking the only link
+      from a bad skill back to the session that produced it.
+    - ``autoManaged``: a skill the loop wrote but did not mark would, once
+      approved, be permanently unpatchable by the loop -- it would look
+      hand-written forever. If the loop created it, it owns it.
     """
-    if not session_id:
-        return
-    for status, path in guard.changed_paths():
-        if path.name != "SKILL.md" or not path.exists():
-            continue
+    for path in guard.WORK_DIR.rglob("SKILL.md"):
+        skill = path.parent.name
+        if (guard.SKILLS_DIR / skill / "SKILL.md").exists():
+            continue  # a patch, not a creation -- leave its frontmatter alone
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        if "createdFrom:" not in text:
-            continue
-        updated = _CREATED_FROM.sub(rf"\1 {session_id}", text, count=1)
+        updated = text
+        if session_id:
+            if "createdFrom:" in updated:
+                updated = _CREATED_FROM.sub(rf"\1 {session_id}", updated, count=1)
+            elif _METADATA_LINE.search(updated):
+                updated = _METADATA_LINE.sub(
+                    f"metadata:\n  createdFrom: {session_id}", updated, count=1
+                )
+        if not guard.is_auto_managed(guard.parse_frontmatter(updated)):
+            if _METADATA_LINE.search(updated):
+                updated = _METADATA_LINE.sub(
+                    "metadata:\n  autoManaged: true", updated, count=1
+                )
+            elif _FRONTMATTER_OPEN.match(updated):
+                updated = _FRONTMATTER_OPEN.sub(
+                    "---\nmetadata:\n  autoManaged: true\n", updated, count=1
+                )
         if updated != text:
-            path.write_text(updated, encoding="utf-8")
+            try:
+                path.write_text(updated, encoding="utf-8")
+            except OSError:
+                continue
 
 
 def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
@@ -141,7 +167,7 @@ def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
     """
     memory = guard.memory_dir(cwd)
     memory.mkdir(parents=True, exist_ok=True)
-    guard.SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    work = guard.WORK_DIR
 
     command = [
         "claude",
@@ -157,7 +183,7 @@ def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
         "--max-turns",
         MAX_TURNS,
         "--add-dir",
-        str(guard.SKILLS_DIR),
+        str(work),
         "--add-dir",
         str(memory),
         "--allowedTools",
@@ -167,7 +193,7 @@ def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
     ]
     return subprocess.run(
         command,
-        cwd=str(guard.SKILLS_DIR),
+        cwd=str(work),
         capture_output=True,
         text=True,
         timeout=TIMEOUT_SECONDS,
@@ -188,6 +214,7 @@ def review(
         return 0
 
     cwd = built.cwd or cwd or str(Path.cwd())
+    pending.prepare_work_tree()
     prompt = build_prompt(built.text, cwd, session_id)
 
     if dry_run:
@@ -219,16 +246,16 @@ def review(
             log({"event": "error", "reason": "claude binary not found"})
             return 0
 
+        # The fork never saw SKILLS_DIR, so there is nothing to revert there.
+        # verify_writes stays as a cheap assertion that this remains true.
         violations = guard.verify_writes(cwd)
-        stamp_provenance(session_id)
+        reply = (result.stdout or "").strip()
+        normalize_new_skills(session_id)
+        queued = pending.capture(session_id, summary=reply[:500])
         memory_diff = guard.diff_snapshot(
             memory_before, guard.snapshot_dir(guard.memory_dir(cwd))
         )
-        reply = (result.stdout or "").strip()
-        sha = guard.commit(
-            f"self-improve: session {session_id[:8] or 'unknown'}\n\n"
-            f"{reply[:500]}\n\nSession: {session_id}"
-        )
+        sha = None
 
         log(
             {
@@ -242,6 +269,7 @@ def review(
                 "truncated": built.truncated,
                 "exit": result.returncode,
                 "commit": sha,
+                "queued": queued,
                 "violations": violations,
                 "memory": memory_diff,
                 "reply": reply[:2000],

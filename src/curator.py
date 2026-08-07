@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import guard  # noqa: E402
+import pending  # noqa: E402
 import review as review_mod  # noqa: E402
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -118,31 +119,31 @@ def stale_transcripts(state: Dict[str, Any]) -> List[Path]:
 
 def sweep(state: Dict[str, Any], limit: int = 10) -> int:
     """Review transcripts whose SessionEnd hook never fired."""
-    pending = stale_transcripts(state)
-    if not pending:
+    queue = stale_transcripts(state)
+    if not queue:
         return 0
-    if len(pending) > limit:
+    if len(queue) > limit:
         # Never silently truncate: a capped sweep that reports nothing reads as
         # "everything covered" when it is not.
         review_mod.log(
             {
                 "event": "sweep-capped",
-                "pending": len(pending),
+                "pending": len(queue),
                 "limit": limit,
-                "deferred": [p.stem for p in pending[limit:]],
+                "deferred": [p.stem for p in queue[limit:]],
             }
         )
-        pending = pending[:limit]
+        queue = queue[:limit]
 
     reviewed = 0
-    for path in pending:
+    for path in queue:
         cwd = _transcript_cwd(path) or str(Path.home())
         try:
             review_mod.review(path, path.stem, cwd)
             reviewed += 1
         except Exception as exc:  # noqa: BLE001
             review_mod.log({"event": "error", "reason": repr(exc), "session": path.stem})
-    review_mod.log({"event": "sweep", "reviewed": reviewed, "pending": len(pending)})
+    review_mod.log({"event": "sweep", "reviewed": reviewed, "pending": len(queue)})
     return reviewed
 
 
@@ -201,7 +202,7 @@ def inventory() -> str:
 def build_prompt() -> str:
     template = (PROMPTS_DIR / "curator.md").read_text(encoding="utf-8")
     return template.replace("{inventory}", inventory()).replace(
-        "{skills_dir}", str(guard.SKILLS_DIR)
+        "{skills_dir}", str(guard.WORK_DIR)
     )
 
 
@@ -220,7 +221,7 @@ def run_fork(prompt: str) -> subprocess.CompletedProcess:
         "--max-turns",
         "40",
         "--add-dir",
-        str(guard.SKILLS_DIR),
+        str(guard.WORK_DIR),
         "--allowedTools",
         *review_mod.ALLOWED_TOOLS,
         "--disallowedTools",
@@ -228,7 +229,7 @@ def run_fork(prompt: str) -> subprocess.CompletedProcess:
     ]
     return subprocess.run(
         command,
-        cwd=str(guard.SKILLS_DIR),
+        cwd=str(guard.WORK_DIR),
         capture_output=True,
         text=True,
         timeout=TIMEOUT_SECONDS,
@@ -243,6 +244,7 @@ def curate() -> int:
         return 0
 
     guard.ensure_skills_repo()
+    pending.prepare_work_tree()
     try:
         result = run_fork(build_prompt())
     except subprocess.TimeoutExpired:
@@ -252,16 +254,19 @@ def curate() -> int:
         review_mod.log({"event": "error", "reason": "claude binary not found"})
         return 0
 
-    # The curator writes only inside the skills tree, so cwd here is irrelevant
+    # The curator writes only inside the work tree, so cwd here is irrelevant
     # to the check -- pass home so the memory root never widens the allowlist.
     violations = guard.verify_writes(str(Path.home()))
     reply = (result.stdout or "").strip()
-    sha = guard.commit(f"curator: library maintenance\n\n{reply[:500]}")
+    # Consolidations and archivals go through the same review queue as
+    # everything else. A curator that could silently merge two skills would be
+    # a bigger hole than the one the queue was built to close.
+    queued = pending.capture(f"curator-{now().date().isoformat()}", summary=reply[:500])
     review_mod.log(
         {
             "event": "curate",
             "exit": result.returncode,
-            "commit": sha,
+            "queued": queued,
             "violations": violations,
             "reply": reply[:2000],
             "stderr": (result.stderr or "")[:1000] if result.returncode else "",
@@ -309,14 +314,14 @@ def spawn_detached() -> None:
 
 def show_status() -> int:
     state = read_state()
-    pending = stale_transcripts(state)
+    queue = stale_transcripts(state)
     print(f"Paused:            {bool(state.get('paused'))}")
     print(f"Interval (hours):  {interval_hours(state)}")
     print(f"Last curator run:  {state.get('last_curator_run', 'never')}")
     print(f"Run count:         {state.get('run_count', 0)}")
     print(f"Due now:           {due(state)}")
-    print(f"Transcripts pending sweep: {len(pending)}")
-    for path in pending[:10]:
+    print(f"Transcripts pending sweep: {len(queue)}")
+    for path in queue[:10]:
         print(f"  {path.stem}  {path.parent.name}")
     print()
     return review_mod.show_status()

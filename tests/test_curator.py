@@ -33,6 +33,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(guard, "LOCK_DIR", tmp_path / "state" / ".locks")
     monkeypatch.setattr(review_mod, "AUDIT_LOG", tmp_path / "state" / "audit.jsonl")
     monkeypatch.setattr(review_mod, "STATE_FILE", tmp_path / "state" / "state.json")
+    monkeypatch.setattr(guard, "PENDING_DIR", tmp_path / "state" / "pending")
+    monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "state" / "work" / "skills")
+    monkeypatch.setattr(guard, "APPROVALS_FILE", tmp_path / "state" / "approvals.json")
 
     bin_dir = tmp_path / "bin"
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
@@ -296,3 +299,38 @@ def test_pause_and_resume(env, monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))
+
+
+# --- curator quarantine ----------------------------------------------------
+
+
+def test_curator_changes_are_queued_not_applied(env):
+    """Consolidation is the most consequential thing this system does."""
+    import pending
+
+    marked_skill(env, "learned")
+    original = (env.skills / "learned" / "SKILL.md").read_text(encoding="utf-8")
+    make_stub(env.bin, f"echo 'curated note' >> '{guard.WORK_DIR}/learned/SKILL.md'; echo consolidated")
+    curator.curate()
+
+    assert (env.skills / "learned" / "SKILL.md").read_text(encoding="utf-8") == original
+    queue = pending.entries()
+    assert len(queue) == 1 and queue[0]["kind"] == "patch"
+    assert queue[0]["session"].startswith("curator-")
+
+
+def test_curator_cannot_touch_hand_written_skills(env):
+    import pending
+
+    handwritten = env.skills / "mine"
+    handwritten.mkdir()
+    from test_review import UNMARKED
+    original = UNMARKED.format(name="mine")
+    (handwritten / "SKILL.md").write_text(original, encoding="utf-8")
+    marked_skill(env, "learned")
+
+    make_stub(env.bin, f"echo 'MEDDLING' >> '{guard.WORK_DIR}/mine/SKILL.md'; echo done")
+    curator.curate()
+
+    assert (handwritten / "SKILL.md").read_text(encoding="utf-8") == original
+    assert pending.entries() == []

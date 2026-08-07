@@ -53,6 +53,19 @@ STATE_DIR = Path(
 )
 LOCK_DIR = STATE_DIR / ".locks"
 
+#: Staging tree. New skills and proposed patches land here for review; nothing
+#: reaches SKILLS_DIR until the user approves it.
+PENDING_DIR = STATE_DIR / "pending"
+
+#: Scratch copy of the skill library handed to the fork. The fork is never told
+#: where the real library is, so quarantine is a property of what it can reach
+#: rather than of a check we run afterwards.
+WORK_DIR = STATE_DIR / "work" / "skills"
+
+#: Records which auto-created skills the user has blessed, and which they have
+#: refused. See skillgate.py.
+APPROVALS_FILE = STATE_DIR / "approvals.json"
+
 #: Env sentinel. Set on every child; both hook entry points exit if they see it.
 SENTINEL = "CLAUDE_SELF_IMPROVE_CHILD"
 

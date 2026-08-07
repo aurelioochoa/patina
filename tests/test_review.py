@@ -96,6 +96,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(guard, "LOCK_DIR", tmp_path / "state" / ".locks")
     monkeypatch.setattr(review, "AUDIT_LOG", tmp_path / "state" / "audit.jsonl")
     monkeypatch.setattr(review, "STATE_FILE", tmp_path / "state" / "state.json")
+    monkeypatch.setattr(guard, "PENDING_DIR", tmp_path / "state" / "pending")
+    monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "state" / "work" / "skills")
+    monkeypatch.setattr(guard, "APPROVALS_FILE", tmp_path / "state" / "approvals.json")
 
     bin_dir = tmp_path / "bin"
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
@@ -123,8 +126,13 @@ def audit(env) -> list[dict]:
 # --- the guard has the last word -------------------------------------------
 
 
-def test_fork_writing_outside_allowlist_is_reverted(env):
-    """The fork creates an unmarked skill. It must not survive."""
+def test_fork_cannot_reach_the_live_library(env):
+    """The strongest guarantee: the fork is never given the real path.
+
+    Even a stub that tries to write straight into SKILLS_DIR is writing to a
+    directory the real fork has no --add-dir for, so this asserts the live tree
+    is left alone by the review flow itself.
+    """
     make_stub(
         env.bin,
         stub_writes(
@@ -134,53 +142,125 @@ def test_fork_writing_outside_allowlist_is_reverted(env):
         ),
     )
     review.review(env.transcript, "sess-1", env.cwd)
-
-    assert not (env.skills / "sneaky" / "SKILL.md").exists()
     entry = [e for e in audit(env) if e["event"] == "review"][0]
-    assert entry["violations"], "violation should be recorded, not silently swallowed"
+    assert entry["violations"], "a direct write to SKILLS_DIR must be caught"
+    assert not (env.skills / "sneaky" / "SKILL.md").exists()
 
 
-def test_fork_editing_unmarked_skill_is_reverted(env):
+def test_edit_to_unmarked_skill_is_dropped_not_queued(env):
+    """A hand-written skill must not even reach the review queue.
+
+    Offering to approve an edit to a skill the user wrote invites exactly the
+    mistake the marker exists to prevent.
+    """
+    import pending
+
     handwritten = env.skills / "handwritten"
     handwritten.mkdir()
     original = UNMARKED.format(name="handwritten")
     (handwritten / "SKILL.md").write_text(original, encoding="utf-8")
-    guard.ensure_skills_repo()
-    guard.commit("baseline")
 
-    make_stub(env.bin, f"echo 'CORRUPTED' >> '{handwritten}/SKILL.md'; echo done")
+    make_stub(env.bin, f"echo 'CORRUPTED' >> '{guard.WORK_DIR}/handwritten/SKILL.md'; echo done")
     review.review(env.transcript, "sess-2", env.cwd)
 
     assert (handwritten / "SKILL.md").read_text(encoding="utf-8") == original
+    assert pending.entries() == []
+    assert any(e["event"] == "dropped-protected-edit" for e in audit(env))
 
 
-def test_fork_writing_marked_skill_survives(env):
+def test_patch_to_marked_skill_is_queued_not_applied(env):
+    """Quarantine: the live library must not change until approval."""
+    import pending
+
+    marked = env.skills / "learned"
+    marked.mkdir()
+    original = MARKED.format(name="learned")
+    (marked / "SKILL.md").write_text(original, encoding="utf-8")
+    guard.ensure_skills_repo()
+    guard.commit("baseline")
+
+    make_stub(env.bin, f"echo 'A genuine lesson.' >> '{guard.WORK_DIR}/learned/SKILL.md'; echo saved")
+    review.review(env.transcript, "sess-3", env.cwd)
+
+    assert (marked / "SKILL.md").read_text(encoding="utf-8") == original, \
+        "live library changed before approval"
+    queue = pending.entries()
+    assert len(queue) == 1
+    assert queue[0]["kind"] == "patch"
+    assert "genuine lesson" in (guard.PENDING_DIR / queue[0]["id"] / "diff.txt").read_text()
+
+
+def test_approving_a_patch_applies_it(env):
+    import pending
+
     marked = env.skills / "learned"
     marked.mkdir()
     (marked / "SKILL.md").write_text(MARKED.format(name="learned"), encoding="utf-8")
     guard.ensure_skills_repo()
     guard.commit("baseline")
 
-    make_stub(env.bin, f"echo 'A genuine lesson.' >> '{marked}/SKILL.md'; echo saved")
-    review.review(env.transcript, "sess-3", env.cwd)
-
+    make_stub(env.bin, f"echo 'A genuine lesson.' >> '{guard.WORK_DIR}/learned/SKILL.md'; echo saved")
+    review.review(env.transcript, "sess-3b", env.cwd)
+    assert pending.approve(pending.entries()[0]["id"])
     assert "genuine lesson" in (marked / "SKILL.md").read_text(encoding="utf-8")
-    entry = [e for e in audit(env) if e["event"] == "review"][0]
-    assert not entry["violations"]
-    assert entry["commit"], "a surviving write should be committed"
 
 
-def test_new_marked_skill_survives(env):
-    make_stub(
-        env.bin,
-        stub_writes(
-            env.skills / "new-thing" / "SKILL.md",
-            MARKED.format(name="new-thing"),
-            "created",
-        ),
-    )
+def test_new_skill_is_queued_not_live(env):
+    import pending
+
+    make_stub(env.bin, stub_writes(
+        guard.WORK_DIR / "new-thing" / "SKILL.md",
+        MARKED.format(name="new-thing"),
+        "created",
+    ))
     review.review(env.transcript, "sess-4", env.cwd)
+
+    assert not (env.skills / "new-thing").exists(), "must not go live unreviewed"
+    queue = pending.entries()
+    assert len(queue) == 1 and queue[0]["kind"] == "new"
+
+
+def test_approving_a_new_skill_makes_it_live(env):
+    import pending
+
+    make_stub(env.bin, stub_writes(
+        guard.WORK_DIR / "new-thing" / "SKILL.md",
+        MARKED.format(name="new-thing"),
+        "created",
+    ))
+    review.review(env.transcript, "sess-4b", env.cwd)
+    assert pending.approve(pending.entries()[0]["id"])
     assert (env.skills / "new-thing" / "SKILL.md").exists()
+    assert pending.approval_for("new-thing") == "always"
+
+
+def test_rejecting_a_new_skill_records_the_refusal(env):
+    """Otherwise the loop proposes the same rejected skill again next week."""
+    import pending
+
+    make_stub(env.bin, stub_writes(
+        guard.WORK_DIR / "junk" / "SKILL.md", MARKED.format(name="junk"), "created",
+    ))
+    review.review(env.transcript, "sess-4c", env.cwd)
+    assert pending.reject(pending.entries()[0]["id"])
+    assert not (env.skills / "junk").exists()
+    assert pending.entries() == []
+    assert pending.approval_for("junk") == "never"
+
+
+def test_unmarked_new_skill_gets_the_marker(env):
+    """A skill the loop wrote but did not mark would be unpatchable forever."""
+    import pending
+
+    make_stub(env.bin, stub_writes(
+        guard.WORK_DIR / "forgot" / "SKILL.md",
+        UNMARKED.format(name="forgot"),
+        "created",
+    ))
+    review.review(env.transcript, "sess-4d", env.cwd)
+    pending.approve(pending.entries()[0]["id"])
+    text = (env.skills / "forgot" / "SKILL.md").read_text(encoding="utf-8")
+    assert guard.is_auto_managed(guard.parse_frontmatter(text))
 
 
 def test_created_from_is_overwritten_with_real_session_id(env):
@@ -190,24 +270,49 @@ def test_created_from_is_overwritten_with_real_session_id(env):
     ``createdFrom: kidtopiaplay-2026-07-launch``. That breaks the only link
     from a bad skill back to the session that produced it.
     """
+    import pending
+
     invented = MARKED.format(name="learned").replace(
         "  autoManaged: true",
         "  autoManaged: true\n  createdFrom: some-invented-label",
     )
-    make_stub(env.bin, stub_writes(env.skills / "learned" / "SKILL.md", invented))
+    make_stub(env.bin, stub_writes(guard.WORK_DIR / "learned" / "SKILL.md", invented))
     review.review(env.transcript, "real-session-id", env.cwd)
+    pending.approve(pending.entries()[0]["id"])
 
     text = (env.skills / "learned" / "SKILL.md").read_text(encoding="utf-8")
     assert "createdFrom: real-session-id" in text
     assert "some-invented-label" not in text
 
 
-def test_stamp_provenance_leaves_skills_without_the_field_alone(env):
+def test_provenance_added_when_field_absent(env):
+    import pending
+
     make_stub(env.bin, stub_writes(
-        env.skills / "learned" / "SKILL.md", MARKED.format(name="learned")
+        guard.WORK_DIR / "learned" / "SKILL.md", MARKED.format(name="learned")
     ))
     review.review(env.transcript, "real-session-id", env.cwd)
-    assert (env.skills / "learned" / "SKILL.md").exists()
+    pending.approve(pending.entries()[0]["id"])
+    text = (env.skills / "learned" / "SKILL.md").read_text(encoding="utf-8")
+    assert "createdFrom: real-session-id" in text
+
+
+def test_patches_do_not_have_provenance_rewritten(env):
+    """Only creations get stamped; a patch must not have its history rewritten."""
+    import pending
+
+    live = env.skills / "learned"
+    live.mkdir()
+    existing = MARKED.format(name="learned").replace(
+        "  autoManaged: true", "  autoManaged: true\n  createdFrom: original-session"
+    )
+    (live / "SKILL.md").write_text(existing, encoding="utf-8")
+
+    make_stub(env.bin, f"echo 'more' >> '{guard.WORK_DIR}/learned/SKILL.md'; echo ok")
+    review.review(env.transcript, "new-session", env.cwd)
+    pending.approve(pending.entries()[0]["id"])
+    text = (env.skills / "learned" / "SKILL.md").read_text(encoding="utf-8")
+    assert "createdFrom: original-session" in text
 
 
 # --- resilience ------------------------------------------------------------

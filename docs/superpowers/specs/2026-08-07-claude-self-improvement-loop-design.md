@@ -273,3 +273,76 @@ battle-tested deployment.
 - Porting the Hermes skill library itself (95+ skills, same `SKILL.md` format). Separate
   effort.
 - Any equivalent of `learning_graph.py` visualization.
+
+---
+
+# Addendum: approval gating (2026-08-07)
+
+Added after the loop was working, in response to: "for every skill it creates,
+needs permission from the author whether it should or should not use it."
+
+## Why quarantine, not only a use-time prompt
+
+The literal request was a per-use permission prompt. That was implemented, but
+as the *backstop*, not the primary control, for two reasons.
+
+**Consent fatigue.** A prompt arrives while the user is mid-task, showing only a
+skill name and one-line description. That is the worst moment to make a quality
+judgement, and the predictable outcome is "never ask again" clicked to get on
+with the work.
+
+**Invocation is not the only way a skill acts.** Every skill's name and
+description is injected into the system prompt every session whether or not it
+is ever invoked. A bad skill in the library costs context and biases behaviour
+without the `Skill` tool firing once. Gating the tool cannot fix that; keeping
+the skill out of the library can.
+
+So: quarantine is primary, the gate is the backstop for paths quarantine misses.
+
+## Quarantine
+
+`pending.prepare_work_tree()` copies the library to `guard.WORK_DIR` before each
+fork. The fork is given `--add-dir` for the copy and never told where the real
+library is, so confinement is a property of what it can *reach* rather than a
+check run afterwards. This is strictly stronger than the original
+revert-after-the-fact design, which is retained as a cheap assertion.
+
+`pending.capture()` then diffs the copy against the live tree:
+
+- New skill → queued as `new`.
+- Change to an `autoManaged` skill → queued as `patch`, with a unified diff.
+- Change to a skill without the marker → **dropped, not queued.** Offering to
+  approve an edit to a hand-written skill invites exactly the mistake the marker
+  exists to prevent. Logged as `dropped-protected-edit`.
+
+Patches are queued because patching is the loop's most common action; a patch
+that skipped review could smuggle bad content into an already-trusted skill.
+
+The curator goes through the same queue. A consolidation that merges two skills
+is the most consequential action in the system and gets no exemption.
+
+## The four states
+
+`skillgate.py`, a `PreToolUse` hook matching `Skill`. Verified against Claude
+Code 2.1.224 — the hook fires for the `Skill` tool, `tool_input.skill` carries
+the name, `session_id` is present, and `deny` genuinely blocks:
+
+    {"tool_name": "Skill",
+     "tool_input": {"skill": "find-docs", "args": "React useEffect"},
+     "session_id": "6564a3bc-..."}
+
+`always` / `never` live in `approvals.json`; session-scoped verdicts are keyed on
+`session_id`. Unmarked and plugin skills are never gated. Any internal error
+allows rather than denies — a bug in the gate must not lock the user out of
+their own skills.
+
+## Marker enforcement
+
+`normalize_new_skills()` forces `autoManaged: true` onto any skill the loop
+created without it. Without this, an unmarked creation would, once approved,
+look hand-written forever and become permanently unpatchable by the loop. It
+also rewrites `createdFrom` to the real session id, since the model reliably
+invents a plausible label instead.
+
+Patches are exempt from both rewrites: a patch must not have its history
+rewritten.

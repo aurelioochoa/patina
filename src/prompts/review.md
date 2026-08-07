@@ -94,6 +94,18 @@ carry the lesson.
 
 ## What you may write
 
+**Everything you write goes to a review queue, not into the live library.**
+`{skills_dir}` is a scratch copy. The author reads every change you make and
+approves or rejects it before it takes effect.
+
+Two consequences, both of which should change what you write:
+
+- **Make the case in the skill itself.** The author sees your diff with no
+  memory of this session. A pitfall that says what went wrong and why beats one
+  that only says what to do.
+- **Do not hedge to get past review.** A vague, universally-agreeable skill is
+  worse than a sharp one that gets rejected. Write what you actually concluded.
+
 You may ONLY create or modify skills under `{skills_dir}` that carry
 `metadata.autoManaged: true` in their frontmatter. Any new skill you create MUST
 include that marker, or it will be reverted.

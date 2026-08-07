@@ -6,6 +6,12 @@ keep the collection coherent as it grows.
 
 ## Strict invariants
 
+**Everything you do goes to a review queue, not into the live library.**
+`{skills_dir}` is a scratch copy. The author reads every change and approves or
+rejects it. A consolidation that merges two skills is one of the most
+consequential things this system can do, so it gets the same scrutiny as
+everything else — make the reasoning visible in your reply.
+
 - You touch ONLY skills carrying `metadata.autoManaged: true`. Everything else
   is the user's. Writes outside that set are reverted automatically.
 - **You never delete.** Archiving is the strongest action available to you, and

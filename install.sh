@@ -86,23 +86,29 @@ with open(settings_path) as fh:
 
 hooks = settings.setdefault("hooks", {})
 
-def ensure(event, command, extra=None):
+def ensure(event, command, extra=None, matcher=None):
     entry = {"type": "command", "command": command, "timeout": 30}
     if extra:
         entry.update(extra)
     matchers = hooks.setdefault(event, [])
-    for matcher in matchers:
-        for hook in matcher.get("hooks", []):
+    for existing in matchers:
+        for hook in existing.get("hooks", []):
             if "self-improve" in str(hook.get("command", "")):
                 hook.clear()
                 hook.update(entry)
                 return f"updated {event}"
-    matchers.append({"hooks": [entry]})
+    block = {"hooks": [entry]}
+    if matcher:
+        block["matcher"] = matcher
+    matchers.append(block)
     return f"added {event}"
 
-# async so neither hook ever holds up the user's session.
+# async so neither session hook ever holds up the user.
 print(ensure("SessionEnd", f"python3 {target}/review.py", {"async": True}))
 print(ensure("SessionStart", f"python3 {target}/curator.py --check"))
+# Backstop: refuse auto-created skills the author has not approved. Must be
+# synchronous -- its verdict is the point.
+print(ensure("PreToolUse", f"python3 {target}/skillgate.py", matcher="Skill"))
 
 with open(settings_path, "w") as fh:
     json.dump(settings, fh, indent=2)
