@@ -254,13 +254,19 @@ def _git(*args: str, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     # Resolved at call time, never as a default argument: a default would bind
     # SKILLS_DIR at import and quietly run git against the real skills tree even
     # when a caller (or a test) has pointed the module elsewhere.
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd if cwd is not None else SKILLS_DIR),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd if cwd is not None else SKILLS_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        # No git, or the skills tree vanished. Degrade to "nothing changed"
+        # rather than raising: losing the audit trail is bad, but taking the
+        # user's session down with it is worse.
+        return subprocess.CompletedProcess(["git", *args], 1, "", str(exc))
 
 
 def ensure_skills_repo() -> None:
