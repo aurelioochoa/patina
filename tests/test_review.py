@@ -97,7 +97,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(review, "AUDIT_LOG", tmp_path / "state" / "audit.jsonl")
     monkeypatch.setattr(review, "STATE_FILE", tmp_path / "state" / "state.json")
     monkeypatch.setattr(guard, "PENDING_DIR", tmp_path / "state" / "pending")
-    monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "state" / "work" / "skills")
+    monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "work" / "skills")
+    monkeypatch.setattr(guard, "WORK_MEMORY", tmp_path / "work" / "memory")
     monkeypatch.setattr(guard, "APPROVALS_FILE", tmp_path / "state" / "approvals.json")
 
     bin_dir = tmp_path / "bin"
@@ -428,3 +429,46 @@ def test_prompt_lists_writable_skills(env):
 
 if __name__ == "__main__":
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))
+
+
+# --- memory staging --------------------------------------------------------
+
+
+def test_memory_is_staged_then_synced(env):
+    """The fork writes memory to scratch; our code copies it in."""
+    import pending
+
+    make_stub(env.bin, stub_writes(
+        guard.WORK_MEMORY / "user-fact.md", "---\nname: user-fact\n---\nA fact.", "saved"
+    ))
+    review.review(env.transcript, "sess-mem", env.cwd)
+
+    live = guard.memory_dir(env.cwd) / "user-fact.md"
+    assert live.exists(), "memory written to scratch never reached the live dir"
+    entry = [e for e in audit(env) if e["event"] == "review"][0]
+    assert any("user-fact.md" in p for p in entry["memory"]["added"])
+
+
+def test_existing_memory_is_visible_to_the_fork(env):
+    """Otherwise the fork duplicates facts it already recorded."""
+    import pending
+
+    live = guard.memory_dir(env.cwd)
+    live.mkdir(parents=True)
+    (live / "existing.md").write_text("already known", encoding="utf-8")
+
+    pending.prepare_work_memory(env.cwd)
+    assert (guard.WORK_MEMORY / "existing.md").read_text(encoding="utf-8") == "already known"
+
+
+def test_memory_deletions_are_not_propagated(env):
+    """The fork is not given a way to erase memories it did not write."""
+    import pending
+
+    live = guard.memory_dir(env.cwd)
+    live.mkdir(parents=True)
+    (live / "keep.md").write_text("keep me", encoding="utf-8")
+
+    make_stub(env.bin, f"rm -f '{guard.WORK_MEMORY}/keep.md'; echo done")
+    review.review(env.transcript, "sess-del", env.cwd)
+    assert (live / "keep.md").exists()

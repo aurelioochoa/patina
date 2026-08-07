@@ -321,3 +321,47 @@ def test_lock_released_after_use(skills):
 
 if __name__ == "__main__":
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))
+
+
+# --- staging must live outside the sensitive config dir ---------------------
+
+
+def _pristine_guard():
+    """Load a private copy of guard with its real default paths.
+
+    Deliberately not importlib.reload(guard): that would reset the shared
+    module's globals to the real config paths and trip the conftest safety net
+    for every test after this one.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_guard_pristine", Path(__file__).resolve().parents[1] / "src" / "guard.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_work_dirs_are_outside_dot_claude():
+    """Regression: Claude Code refuses Write under ~/.claude.
+
+    Staging inside it meant every fork reported success and saved nothing --
+    silently, for eight consecutive runs. The exact refusal was:
+    'Write requires permission approval for sensitive files in ~/.claude/'.
+    """
+    fresh = _pristine_guard()
+    claude_dir = (Path.home() / ".claude").resolve()
+    for name in ("WORK_ROOT", "WORK_DIR", "WORK_MEMORY"):
+        path = Path(getattr(fresh, name)).resolve()
+        assert claude_dir not in path.parents and path != claude_dir, (
+            f"guard.{name} is under ~/.claude; the fork cannot write there"
+        )
+
+
+def test_pending_and_state_stay_inside_dot_claude():
+    """The converse: our own Python writes these, and they belong with config."""
+    fresh = _pristine_guard()
+    claude_dir = (Path.home() / ".claude").resolve()
+    for name in ("STATE_DIR", "PENDING_DIR", "SKILLS_DIR"):
+        assert claude_dir in Path(getattr(fresh, name)).resolve().parents

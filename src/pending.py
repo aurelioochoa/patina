@@ -73,6 +73,36 @@ def prepare_work_tree() -> Path:
     return guard.WORK_DIR
 
 
+def prepare_work_memory(cwd: str) -> Path:
+    """Scratch copy of the project's memory directory for the fork to edit."""
+    shutil.rmtree(guard.WORK_MEMORY, ignore_errors=True)
+    guard.WORK_MEMORY.mkdir(parents=True, exist_ok=True)
+    live = guard.memory_dir(cwd)
+    if live.is_dir():
+        shutil.copytree(live, guard.WORK_MEMORY, dirs_exist_ok=True)
+    return guard.WORK_MEMORY
+
+
+def sync_memory(cwd: str) -> Dict[str, List[str]]:
+    """Copy the fork's memory edits into the live memory directory.
+
+    Memory is applied rather than queued: the user's ask was about skills, and
+    memory records who they are rather than instructing how I behave. Deletions
+    are not propagated -- the fork is not given a way to erase memories it did
+    not write.
+    """
+    live = guard.memory_dir(cwd)
+    before = guard.snapshot_dir(live)
+    live.mkdir(parents=True, exist_ok=True)
+    for path in sorted(guard.WORK_MEMORY.rglob("*")):
+        if not path.is_file():
+            continue
+        target = live / path.relative_to(guard.WORK_MEMORY)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+    return guard.diff_snapshot(before, guard.snapshot_dir(live))
+
+
 def _files(root: Path) -> Dict[str, Path]:
     if not root.is_dir():
         return {}

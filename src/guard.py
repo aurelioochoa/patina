@@ -57,10 +57,21 @@ LOCK_DIR = STATE_DIR / ".locks"
 #: reaches SKILLS_DIR until the user approves it.
 PENDING_DIR = STATE_DIR / "pending"
 
-#: Scratch copy of the skill library handed to the fork. The fork is never told
-#: where the real library is, so quarantine is a property of what it can reach
-#: rather than of a check we run afterwards.
-WORK_DIR = STATE_DIR / "work" / "skills"
+#: Scratch trees handed to the fork. Deliberately OUTSIDE ~/.claude: Claude Code
+#: treats its own config directory as sensitive and refuses Write there no
+#: matter what --add-dir and --permission-mode say --
+#:
+#:     Write requires permission approval for sensitive files in ~/.claude/
+#:
+#: A fork staged inside ~/.claude therefore saves nothing, silently, while
+#: reporting success. Staging out here means the child never needs elevated
+#: permission at all; our own Python moves approved content in afterwards.
+WORK_ROOT = Path(
+    os.environ.get("CLAUDE_SELF_IMPROVE_WORK_DIR")
+    or (HOME / ".cache" / "claude-self-improve")
+)
+WORK_DIR = WORK_ROOT / "skills"
+WORK_MEMORY = WORK_ROOT / "memory"
 
 #: Records which auto-created skills the user has blessed, and which they have
 #: refused. See skillgate.py.

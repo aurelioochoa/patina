@@ -101,7 +101,7 @@ def build_prompt(digest_text: str, cwd: str, session_id: str) -> str:
         # The fork is pointed at the scratch copy, never the live library. It is
         # told so explicitly: a skill author who thinks their edit ships
         # immediately writes differently from one who knows it faces review.
-        template.replace("{memory_dir}", str(guard.memory_dir(cwd)))
+        template.replace("{memory_dir}", str(guard.WORK_MEMORY))
         .replace("{skills_dir}", str(guard.WORK_DIR))
         .replace("{writable_skills}", describe_writable())
         .replace("{session_id}", session_id or "unknown")
@@ -165,8 +165,7 @@ def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
     ``--add-dir`` is a harness-level boundary and the first line of defence;
     ``guard.verify_writes`` afterwards is the one that actually decides.
     """
-    memory = guard.memory_dir(cwd)
-    memory.mkdir(parents=True, exist_ok=True)
+    memory = pending.prepare_work_memory(cwd)
     work = guard.WORK_DIR
 
     command = [
@@ -234,7 +233,6 @@ def review(
             return 0
 
         guard.ensure_skills_repo()
-        memory_before = guard.snapshot_dir(guard.memory_dir(cwd))
         started = now()
 
         try:
@@ -252,9 +250,7 @@ def review(
         reply = (result.stdout or "").strip()
         normalize_new_skills(session_id)
         queued = pending.capture(session_id, summary=reply[:500])
-        memory_diff = guard.diff_snapshot(
-            memory_before, guard.snapshot_dir(guard.memory_dir(cwd))
-        )
+        memory_diff = pending.sync_memory(cwd)
         sha = None
 
         log(
