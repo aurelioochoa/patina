@@ -183,6 +183,33 @@ def test_new_marked_skill_survives(env):
     assert (env.skills / "new-thing" / "SKILL.md").exists()
 
 
+def test_created_from_is_overwritten_with_real_session_id(env):
+    """The model invents a plausible label instead of using the session id.
+
+    Observed in the first live run: it wrote
+    ``createdFrom: kidtopiaplay-2026-07-launch``. That breaks the only link
+    from a bad skill back to the session that produced it.
+    """
+    invented = MARKED.format(name="learned").replace(
+        "  autoManaged: true",
+        "  autoManaged: true\n  createdFrom: some-invented-label",
+    )
+    make_stub(env.bin, stub_writes(env.skills / "learned" / "SKILL.md", invented))
+    review.review(env.transcript, "real-session-id", env.cwd)
+
+    text = (env.skills / "learned" / "SKILL.md").read_text(encoding="utf-8")
+    assert "createdFrom: real-session-id" in text
+    assert "some-invented-label" not in text
+
+
+def test_stamp_provenance_leaves_skills_without_the_field_alone(env):
+    make_stub(env.bin, stub_writes(
+        env.skills / "learned" / "SKILL.md", MARKED.format(name="learned")
+    ))
+    review.review(env.transcript, "real-session-id", env.cwd)
+    assert (env.skills / "learned" / "SKILL.md").exists()
+
+
 # --- resilience ------------------------------------------------------------
 
 

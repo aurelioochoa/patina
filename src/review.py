@@ -23,6 +23,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -103,6 +104,33 @@ def build_prompt(digest_text: str, cwd: str, session_id: str) -> str:
         .replace("{today}", dt.date.today().isoformat())
         .replace("{digest}", digest_text)
     )
+
+
+_CREATED_FROM = re.compile(r"^(\s*createdFrom:).*$", re.MULTILINE)
+
+
+def stamp_provenance(session_id: str) -> None:
+    """Overwrite ``createdFrom`` with the real session id.
+
+    Asked to record the session id, the model writes a plausible-looking label
+    of its own instead ("kidtopiaplay-2026-07-launch"). That silently breaks the
+    one link from a bad skill back to the session that produced it, so correct
+    it here rather than trusting the prompt.
+    """
+    if not session_id:
+        return
+    for status, path in guard.changed_paths():
+        if path.name != "SKILL.md" or not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "createdFrom:" not in text:
+            continue
+        updated = _CREATED_FROM.sub(rf"\1 {session_id}", text, count=1)
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
 
 
 def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
@@ -192,6 +220,7 @@ def review(
             return 0
 
         violations = guard.verify_writes(cwd)
+        stamp_provenance(session_id)
         memory_diff = guard.diff_snapshot(
             memory_before, guard.snapshot_dir(guard.memory_dir(cwd))
         )
