@@ -1,4 +1,4 @@
-# claude-self-improve
+# patina
 
 A port of [Hermes Agent](https://github.com/hermes-agent)'s background self-improvement loop
 to Claude Code.
@@ -7,11 +7,9 @@ Claude Code sessions are amnesiac. A correction given in one session — "stop f
 that", "you always miss this step" — is gone by the next. This adds a background loop that
 reviews finished sessions and writes what it learned into your skill library and memory.
 
-## Status
-
-**Code complete, not yet activated.** 95 tests pass. One live end-to-end run was
-attempted and blocked by an account session limit, so the loop has never
-actually written a skill. Hooks are deliberately unregistered until it has.
+Named for what builds on a surface through use, and is worth keeping rather than cleaning
+off. The scripts still install to `~/.claude/self-improve/`; the paths and environment
+variables are unchanged.
 
 See [the spec](docs/superpowers/specs/2026-08-07-claude-self-improvement-loop-design.md).
 
@@ -88,8 +86,9 @@ own skills.
 
 ```sh
 review.py  --status          # runs, no-op rate, allowlist violations
-curator.py --status          # interval, pending sweep, run count
+curator.py --status          # intervals, pending sweep, run count
 curator.py --run             # run the curator now, ignoring the interval
+curator.py --sweep-only      # catch up on missed sessions, skip consolidation
 curator.py --pause           # stop the loop without uninstalling
 git -C ~/.claude/skills log  # everything it has ever written
 ```
@@ -123,14 +122,25 @@ Remove the marker to take it back.
 | `CLAUDE_SELF_IMPROVE_STATE_DIR` | `~/.claude/self-improve` | redirect state |
 | `CLAUDE_SELF_IMPROVE_PROJECTS_DIR` | `~/.claude/projects` | redirect transcript discovery |
 
-Curator interval lives in `state.json` as `interval_hours` (default 168).
+Intervals live in `state.json`:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `interval_hours` | `168` | how often the curator consolidates the library |
+| `sweep_interval_hours` | `24` | how often the sweep picks up missed sessions |
+| `sweep_limit` | `10` | forks per sweep — a spend ceiling as much as a batch size |
 
 ## How it works
 
 - A `SessionEnd` hook forks a detached, headless `claude -p` that reads a bounded digest of
   the session transcript and decides whether anything is worth keeping.
-- A `SessionStart` hook checks an interval and, roughly weekly, runs a curator pass that
-  consolidates overlapping skills and archives stale ones. No daemon.
+- A `SessionStart` hook checks two intervals and forks whatever is due. No daemon. Daily, a
+  sweep reviews sessions whose `SessionEnd` hook never fired — a hard kill, a closed
+  terminal, a crash. Weekly, a curator pass consolidates overlapping skills and archives
+  stale ones.
+- A review that fails is left unwatermarked so the sweep retries it, up to three attempts.
+  The first failure in the wild was an account limit, which is transient by definition;
+  treating that as reviewed loses the session permanently.
 - Writes are confined to skills explicitly marked `metadata.autoManaged: true`, enforced both
   in the prompt and by a post-run check that reverts anything outside the allowlist.
 - Every write is a git commit in a local audit repo, plus a line in an append-only log.
