@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Install the self-improvement loop into ~/.claude.
+# Install patina, the background self-improvement loop, into ~/.claude.
 #
-# Copies scripts to ~/.claude/self-improve/ and initialises the local audit
+# Copies scripts to ~/.claude/patina/ and initialises the local audit
 # repo. Does NOT register hooks -- that is a separate, deliberate step, because
 # a broken SessionStart hook fires on every session and you would be debugging
 # it inside the tool it is breaking. Run --register-hooks only once the manual
@@ -14,7 +14,12 @@ set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-TARGET="$CLAUDE_DIR/self-improve"
+TARGET="$CLAUDE_DIR/patina"
+# Pre-rename layout. Carried over rather than abandoned: it holds the review
+# watermarks, the pending queue, the approvals and the audit log.
+LEGACY_TARGET="$CLAUDE_DIR/self-improve"
+LEGACY_WORK="$HOME/.cache/claude-self-improve"
+WORK="$HOME/.cache/patina"
 SETTINGS="$CLAUDE_DIR/settings.json"
 SKILLS="$CLAUDE_DIR/skills"
 
@@ -23,11 +28,29 @@ ok()    { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 warn()  { printf '  \033[33m!\033[0m %s\n' "$*"; }
 die()   { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Move a pre-rename installation into place rather than leaving two half-live
+# trees. The state is the valuable part: watermarks, pending queue, approvals,
+# audit log. Losing it makes the loop re-review every recent session.
+migrate() {
+  if [ -d "$LEGACY_TARGET" ] && [ ! -d "$TARGET" ]; then
+    mv "$LEGACY_TARGET" "$TARGET"
+    ok "moved state from $LEGACY_TARGET"
+  elif [ -d "$LEGACY_TARGET" ]; then
+    warn "both $LEGACY_TARGET and $TARGET exist — merge them by hand"
+  fi
+  if [ -d "$LEGACY_WORK" ] && [ ! -d "$WORK" ]; then
+    mv "$LEGACY_WORK" "$WORK"
+    ok "moved work tree from $LEGACY_WORK"
+  fi
+}
+
 install_scripts() {
   echo "Installing to $TARGET"
   command -v claude >/dev/null || die "claude not found on PATH"
   command -v git    >/dev/null || die "git not found on PATH"
   command -v python3 >/dev/null || die "python3 not found on PATH"
+
+  migrate
 
   mkdir -p "$TARGET/prompts"
   cp "$SOURCE_DIR"/src/*.py "$TARGET/"
@@ -40,8 +63,8 @@ install_scripts() {
     ok "audit repo already initialised"
   else
     git -C "$SKILLS" init -q
-    git -C "$SKILLS" config user.name  "claude-self-improve"
-    git -C "$SKILLS" config user.email "self-improve@localhost"
+    git -C "$SKILLS" config user.name  "patina"
+    git -C "$SKILLS" config user.email "patina@localhost"
     git -C "$SKILLS" add -A
     git -C "$SKILLS" commit -q --allow-empty -m "Baseline before autonomous writes"
     ok "audit repo initialised at $SKILLS"
@@ -49,7 +72,7 @@ install_scripts() {
 
   # Runtime state lives here, deliberately outside the source tree so it can
   # never be committed to the public repo.
-  mkdir -p "$CLAUDE_DIR/self-improve/.locks"
+  mkdir -p "$TARGET/.locks"
   ok "state directory ready"
 
   cat <<EOF
@@ -93,7 +116,7 @@ def ensure(event, command, extra=None, matcher=None):
     matchers = hooks.setdefault(event, [])
     for existing in matchers:
         for hook in existing.get("hooks", []):
-            if "self-improve" in str(hook.get("command", "")):
+            if any(n in str(hook.get("command", "")) for n in ("patina", "self-improve")):
                 hook.clear()
                 hook.update(entry)
                 return f"updated {event}"
@@ -134,7 +157,7 @@ for event, matchers in list(settings.get("hooks", {}).items()):
     for matcher in matchers:
         matcher["hooks"] = [
             h for h in matcher.get("hooks", [])
-            if "self-improve" not in str(h.get("command", ""))
+            if not any(n in str(h.get("command", "")) for n in ("patina", "self-improve"))
         ]
     settings["hooks"][event] = [m for m in matchers if m.get("hooks")]
     if not settings["hooks"][event]:
@@ -145,7 +168,7 @@ with open(path, "w") as fh:
 PY
     ok "hooks removed"
   fi
-  rm -rf "$TARGET"
+  rm -rf "$TARGET" "$LEGACY_TARGET"
   ok "scripts removed"
   warn "left alone: $SKILLS (your skills and their git history)"
 }

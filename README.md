@@ -8,29 +8,28 @@ that", "you always miss this step" — is gone by the next. This adds a backgrou
 reviews finished sessions and writes what it learned into your skill library and memory.
 
 Named for what builds on a surface through use, and is worth keeping rather than cleaning
-off. The scripts still install to `~/.claude/self-improve/`; the paths and environment
-variables are unchanged.
+off.
 
 See [the spec](docs/superpowers/specs/2026-08-07-claude-self-improvement-loop-design.md).
 
 ## Install
 
 ```sh
-./install.sh                  # copy scripts to ~/.claude/self-improve, init audit repo
+./install.sh                  # copy scripts to ~/.claude/patina, init audit repo
 ```
 
 This does **not** activate anything. Verify by hand first:
 
 ```sh
 # 1. Dry run -- builds the prompt, forks nothing
-python3 ~/.claude/self-improve/review.py \
+python3 ~/.claude/patina/review.py \
     --transcript ~/.claude/projects/<slug>/<session>.jsonl --dry-run
 
 # 2. Rehearsal with real auth but redirected writes, so the live
 #    skill library cannot be touched
-export CLAUDE_SELF_IMPROVE_SKILLS_DIR=/tmp/rehearsal/skills
-export CLAUDE_SELF_IMPROVE_STATE_DIR=/tmp/rehearsal/state
-python3 ~/.claude/self-improve/review.py --transcript <transcript>
+export PATINA_SKILLS_DIR=/tmp/rehearsal/skills
+export PATINA_STATE_DIR=/tmp/rehearsal/state
+python3 ~/.claude/patina/review.py --transcript <transcript>
 git -C /tmp/rehearsal/skills log -p
 
 # 3. Only once that looks right
@@ -115,12 +114,16 @@ Remove the marker to take it back.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_SELF_IMPROVE_MODEL` | `sonnet` | model for both review and curator |
-| `CLAUDE_SELF_IMPROVE_TIMEOUT` | `600` | per-review timeout, seconds |
-| `CLAUDE_SELF_IMPROVE_CURATOR_TIMEOUT` | `900` | curator timeout, seconds |
-| `CLAUDE_SELF_IMPROVE_SKILLS_DIR` | `~/.claude/skills` | redirect writes (rehearsal) |
-| `CLAUDE_SELF_IMPROVE_STATE_DIR` | `~/.claude/self-improve` | redirect state |
-| `CLAUDE_SELF_IMPROVE_PROJECTS_DIR` | `~/.claude/projects` | redirect transcript discovery |
+| `PATINA_MODEL` | `sonnet` | model for both review and curator |
+| `PATINA_TIMEOUT` | `600` | per-review timeout, seconds |
+| `PATINA_CURATOR_TIMEOUT` | `900` | curator timeout, seconds |
+| `PATINA_SKILLS_DIR` | `~/.claude/skills` | redirect writes (rehearsal) |
+| `PATINA_STATE_DIR` | `~/.claude/patina` | redirect state |
+| `PATINA_PROJECTS_DIR` | `~/.claude/projects` | redirect transcript discovery |
+| `PATINA_WORK_DIR` | `~/.cache/patina` | scratch tree handed to the fork |
+
+The pre-rename `CLAUDE_SELF_IMPROVE_*` spellings are still read as a fallback, so an old
+export in a shell profile keeps working.
 
 Intervals live in `state.json`:
 
@@ -161,7 +164,7 @@ agent cites against itself months after the problem was fixed.
 
 ## Layout
 
-Source lives here. Runtime state lives in `~/.claude/self-improve/` and is never committed —
+Source lives here. Runtime state lives in `~/.claude/patina/` and is never committed —
 `install.sh` puts the scripts in place without bringing the tree with them.
 
 ## License

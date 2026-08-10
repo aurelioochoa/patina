@@ -135,7 +135,7 @@ name: <lowercase-hyphenated-name>
 description: Use when <trigger>. <one-line behavior>.
 metadata:
   autoManaged: true
-  createdBy: claude-self-improve
+  createdBy: patina
   createdFrom: {session_id}
 ---
 ```

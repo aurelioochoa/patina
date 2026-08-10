@@ -34,7 +34,7 @@ GUARDED = (
 )
 
 REAL_CLAUDE = (Path.home() / ".claude").resolve()
-REAL_CACHE = (Path.home() / ".cache" / "claude-self-improve").resolve()
+REAL_CACHE = (Path.home() / ".cache" / "patina").resolve()
 
 
 def _is_real(path: Path) -> bool:

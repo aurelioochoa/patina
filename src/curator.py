@@ -45,8 +45,8 @@ import review as review_mod  # noqa: E402
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 DEFAULT_INTERVAL_HOURS = 24 * 7  # matches Hermes DEFAULT_INTERVAL_HOURS
-MODEL = os.environ.get("CLAUDE_SELF_IMPROVE_MODEL", "sonnet")
-TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_SELF_IMPROVE_CURATOR_TIMEOUT", "900"))
+MODEL = guard.env("MODEL", "sonnet")
+TIMEOUT_SECONDS = int(guard.env("CURATOR_TIMEOUT", "900"))
 
 #: Transcripts older than this are never swept. A months-old session is not a
 #: missed lesson, it is history.

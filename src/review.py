@@ -39,8 +39,8 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 AUDIT_LOG = guard.STATE_DIR / "audit.jsonl"
 STATE_FILE = guard.STATE_DIR / "state.json"
 
-MODEL = os.environ.get("CLAUDE_SELF_IMPROVE_MODEL", "sonnet")
-TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_SELF_IMPROVE_TIMEOUT", "600"))
+MODEL = guard.env("MODEL", "sonnet")
+TIMEOUT_SECONDS = int(guard.env("TIMEOUT", "600"))
 MAX_TURNS = "30"
 
 #: How many times a transcript may fail before the loop stops retrying it.

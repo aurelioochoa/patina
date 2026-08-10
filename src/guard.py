@@ -1,4 +1,4 @@
-"""Safety kernel for the self-improvement loop.
+"""Safety kernel for patina, the background self-improvement loop.
 
 Every other component imports this. Three jobs:
 
@@ -37,6 +37,22 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 HOME = Path.home()
+
+
+def env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Read ``PATINA_<name>``, falling back to the pre-rename spelling.
+
+    The project was called claude-self-improve until it was renamed. The old
+    variables keep working: they may still be exported in a shell profile, and
+    a config surface that silently stops being read is worse than two spellings.
+    """
+    return (
+        os.environ.get(f"PATINA_{name}")
+        or os.environ.get(f"CLAUDE_SELF_IMPROVE_{name}")
+        or default
+    )
+
+
 # install.sh honours the same variable; the two must agree or the installer
 # would wire hooks to a tree the scripts never look at.
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
@@ -44,13 +60,9 @@ CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (HOME / ".claude"))
 # end-to-end rehearsal possible: point these at a scratch tree while
 # CLAUDE_CONFIG_DIR stays on the real config, so the fork authenticates
 # normally but cannot touch the live skill library.
-SKILLS_DIR = Path(os.environ.get("CLAUDE_SELF_IMPROVE_SKILLS_DIR") or (CLAUDE_DIR / "skills"))
-PROJECTS_DIR = Path(
-    os.environ.get("CLAUDE_SELF_IMPROVE_PROJECTS_DIR") or (CLAUDE_DIR / "projects")
-)
-STATE_DIR = Path(
-    os.environ.get("CLAUDE_SELF_IMPROVE_STATE_DIR") or (CLAUDE_DIR / "self-improve")
-)
+SKILLS_DIR = Path(env("SKILLS_DIR") or (CLAUDE_DIR / "skills"))
+PROJECTS_DIR = Path(env("PROJECTS_DIR") or (CLAUDE_DIR / "projects"))
+STATE_DIR = Path(env("STATE_DIR") or (CLAUDE_DIR / "patina"))
 LOCK_DIR = STATE_DIR / ".locks"
 
 #: Staging tree. New skills and proposed patches land here for review; nothing
@@ -66,10 +78,7 @@ PENDING_DIR = STATE_DIR / "pending"
 #: A fork staged inside ~/.claude therefore saves nothing, silently, while
 #: reporting success. Staging out here means the child never needs elevated
 #: permission at all; our own Python moves approved content in afterwards.
-WORK_ROOT = Path(
-    os.environ.get("CLAUDE_SELF_IMPROVE_WORK_DIR")
-    or (HOME / ".cache" / "claude-self-improve")
-)
+WORK_ROOT = Path(env("WORK_DIR") or (HOME / ".cache" / "patina"))
 WORK_DIR = WORK_ROOT / "skills"
 WORK_MEMORY = WORK_ROOT / "memory"
 
@@ -78,19 +87,24 @@ WORK_MEMORY = WORK_ROOT / "memory"
 APPROVALS_FILE = STATE_DIR / "approvals.json"
 
 #: Env sentinel. Set on every child; both hook entry points exit if they see it.
-SENTINEL = "CLAUDE_SELF_IMPROVE_CHILD"
+SENTINEL = "PATINA_CHILD"
+
+#: Pre-rename spelling, still honoured: a fork spawned by the old scripts may
+#: outlive the upgrade, and it must not be treated as a user session.
+LEGACY_SENTINEL = "CLAUDE_SELF_IMPROVE_CHILD"
 
 #: First line of every prompt handed to a fork. The sentinel above stops a fork
 #: reviewing *itself*; this stops the sweep reviewing a fork *later*. The fork's
 #: own transcript is written to ``~/.claude/projects`` like any other session,
 #: and a sweep that picked it up would feed the review prompt back into the
 #: review prompt.
-FORK_MARKER = "[claude-self-improve fork — not a user session, never review]"
+FORK_MARKER = "[patina fork — not a user session, never review]"
 
 #: Forks that ran before the marker existed. Matched against the first record
 #: of a transcript only, which for a fork is the prompt itself -- a user session
 #: that merely discusses these strings does not open with them.
 _LEGACY_FORK_OPENINGS = (
+    "[claude-self-improve fork",
     "You are reviewing a finished Claude Code session",
     "You are the curator for a Claude Code skill library",
 )
@@ -106,14 +120,14 @@ AUTO_MANAGED_KEY = "autoManaged"
 
 def is_child() -> bool:
     """True when running inside a fork we spawned. Entry points must exit."""
-    return os.environ.get(SENTINEL) == "1"
+    return "1" in (os.environ.get(SENTINEL), os.environ.get(LEGACY_SENTINEL))
 
 
 def child_env() -> Dict[str, str]:
     """Environment for the forked ``claude -p``."""
-    env = dict(os.environ)
-    env[SENTINEL] = "1"
-    return env
+    child = dict(os.environ)
+    child[SENTINEL] = "1"
+    return child
 
 
 #: Passed to every child. The second half of the recursion guard, and the
@@ -351,8 +365,8 @@ def ensure_skills_repo() -> None:
     if (SKILLS_DIR / ".git").is_dir():
         return
     _git("init", "-q")
-    _git("config", "user.name", "claude-self-improve")
-    _git("config", "user.email", "self-improve@localhost")
+    _git("config", "user.name", "patina")
+    _git("config", "user.email", "patina@localhost")
     if _git("rev-parse", "HEAD").returncode != 0:
         _git("add", "-A")
         _git("commit", "-q", "--allow-empty", "-m", "Baseline before autonomous writes")
