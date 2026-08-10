@@ -80,6 +80,21 @@ APPROVALS_FILE = STATE_DIR / "approvals.json"
 #: Env sentinel. Set on every child; both hook entry points exit if they see it.
 SENTINEL = "CLAUDE_SELF_IMPROVE_CHILD"
 
+#: First line of every prompt handed to a fork. The sentinel above stops a fork
+#: reviewing *itself*; this stops the sweep reviewing a fork *later*. The fork's
+#: own transcript is written to ``~/.claude/projects`` like any other session,
+#: and a sweep that picked it up would feed the review prompt back into the
+#: review prompt.
+FORK_MARKER = "[claude-self-improve fork — not a user session, never review]"
+
+#: Forks that ran before the marker existed. Matched against the first record
+#: of a transcript only, which for a fork is the prompt itself -- a user session
+#: that merely discusses these strings does not open with them.
+_LEGACY_FORK_OPENINGS = (
+    "You are reviewing a finished Claude Code session",
+    "You are the curator for a Claude Code skill library",
+)
+
 #: Frontmatter key that marks a skill as ours to write. No marker, no write.
 AUTO_MANAGED_KEY = "autoManaged"
 
@@ -209,6 +224,33 @@ def project_slug(cwd: str | Path) -> str:
 def memory_dir(cwd: str | Path) -> Path:
     """Per-project memory directory for a working directory."""
     return PROJECTS_DIR / project_slug(cwd) / "memory"
+
+
+def own_project_slugs() -> Set[str]:
+    """Project directory names Claude Code gives the loop's own trees.
+
+    A fork runs with ``cwd`` set to the work tree, so its transcript lands in
+    the project directory named after it. Deriving the slugs rather than
+    hard-coding them keeps the rehearsal overrides working.
+    """
+    return {project_slug(root) for root in (WORK_ROOT, WORK_DIR, WORK_MEMORY, SKILLS_DIR, STATE_DIR)}
+
+
+def is_own_transcript(path: Path) -> bool:
+    """True when this transcript is a fork we spawned, not a user session.
+
+    Two checks because neither alone is enough: the slug covers every fork this
+    installation will spawn from now on, and the prompt marker covers forks
+    from an earlier configuration whose work tree no longer exists.
+    """
+    if Path(path).parent.name in own_project_slugs():
+        return True
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            head = handle.readline(32768)
+    except OSError:
+        return False
+    return FORK_MARKER in head or any(sign in head for sign in _LEGACY_FORK_OPENINGS)
 
 
 def writable_skills() -> List[Path]:

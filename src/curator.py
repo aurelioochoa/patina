@@ -6,13 +6,14 @@ fast check (a state file read, no subprocess); if the interval has elapsed, the
 real work is forked detached and this process returns immediately so the user's
 session is never held up.
 
-Two jobs behind the one interval check:
+Two jobs on two intervals:
 
-1. **Sweep** — review transcripts that finished without their SessionEnd hook
-   firing (hard kill, terminal closed, crash). This is what makes SessionEnd
-   sufficient rather than merely usual.
-2. **Curate** — maintenance over the autoManaged library: consolidate overlaps,
-   split overgrown skills, archive stale ones. Never deletes.
+1. **Sweep** — daily. Review transcripts that finished without their SessionEnd
+   hook firing (hard kill, terminal closed, crash). This is what makes
+   SessionEnd sufficient rather than merely usual, and it only holds if the
+   sweep runs often enough to outpace the sessions it is covering for.
+2. **Curate** — weekly. Maintenance over the autoManaged library: consolidate
+   overlaps, split overgrown skills, archive stale ones. Never deletes.
 
 Usage as a hook (stdin carries the payload):
     curator.py --check
@@ -54,6 +55,17 @@ SWEEP_MAX_AGE_DAYS = 14
 #: Do not sweep a transcript still being written to.
 SWEEP_MIN_IDLE_MINUTES = 30
 
+#: The sweep runs on its own, much shorter interval than the curate pass.
+#: Sharing the weekly interval capped coverage at SWEEP_LIMIT transcripts a
+#: week, which is slower than sessions accumulate: the backlog grew until
+#: transcripts aged past SWEEP_MAX_AGE_DAYS and were dropped unread. Daily, the
+#: same per-run cap clears seven times as many while keeping each burst small.
+DEFAULT_SWEEP_INTERVAL_HOURS = 24
+
+#: Forks per sweep. Each is a real model call, so this is a spend ceiling as
+#: much as a batch size; state key ``sweep_limit`` overrides it.
+DEFAULT_SWEEP_LIMIT = 10
+
 
 def now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -74,10 +86,24 @@ def interval_hours(state: Dict[str, Any]) -> float:
         return DEFAULT_INTERVAL_HOURS
 
 
-def due(state: Dict[str, Any]) -> bool:
+def sweep_interval_hours(state: Dict[str, Any]) -> float:
+    try:
+        return float(state.get("sweep_interval_hours", DEFAULT_SWEEP_INTERVAL_HOURS))
+    except (TypeError, ValueError):
+        return DEFAULT_SWEEP_INTERVAL_HOURS
+
+
+def sweep_limit(state: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(state.get("sweep_limit", DEFAULT_SWEEP_LIMIT)))
+    except (TypeError, ValueError):
+        return DEFAULT_SWEEP_LIMIT
+
+
+def _elapsed(state: Dict[str, Any], key: str, hours: float) -> bool:
     if state.get("paused"):
         return False
-    last = state.get("last_curator_run")
+    last = state.get(key)
     if not last:
         return True
     try:
@@ -86,7 +112,16 @@ def due(state: Dict[str, Any]) -> bool:
         return True
     if previous.tzinfo is None:
         previous = previous.replace(tzinfo=dt.timezone.utc)
-    return now() - previous >= dt.timedelta(hours=interval_hours(state))
+    return now() - previous >= dt.timedelta(hours=hours)
+
+
+def due(state: Dict[str, Any]) -> bool:
+    return _elapsed(state, "last_curator_run", interval_hours(state))
+
+
+def sweep_due(state: Dict[str, Any]) -> bool:
+    """Whether the backstop sweep should run, independently of curation."""
+    return _elapsed(state, "last_sweep_run", sweep_interval_hours(state))
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +148,17 @@ def stale_transcripts(state: Dict[str, Any]) -> List[Path]:
             continue
         if float(watermarks.get(path.stem, 0)) >= mtime:
             continue
+        # The SessionEnd path is protected by the env sentinel; the sweep finds
+        # transcripts by glob and has to recognise the loop's own forks itself.
+        if guard.is_own_transcript(path):
+            continue
         found.append(path)
     return sorted(found, key=lambda p: p.stat().st_mtime)
 
 
-def sweep(state: Dict[str, Any], limit: int = 10) -> int:
+def sweep(state: Dict[str, Any], limit: Optional[int] = None) -> int:
     """Review transcripts whose SessionEnd hook never fired."""
+    limit = sweep_limit(state) if limit is None else limit
     queue = stale_transcripts(state)
     if not queue:
         return 0
@@ -201,9 +241,9 @@ def inventory() -> str:
 
 def build_prompt() -> str:
     template = (PROMPTS_DIR / "curator.md").read_text(encoding="utf-8")
-    return template.replace("{inventory}", inventory()).replace(
-        "{skills_dir}", str(guard.WORK_DIR)
-    )
+    return guard.FORK_MARKER + "\n\n" + template.replace(
+        "{inventory}", inventory()
+    ).replace("{skills_dir}", str(guard.WORK_DIR))
 
 
 def run_fork(prompt: str) -> subprocess.CompletedProcess:
@@ -290,20 +330,29 @@ def run(sweep_only: bool = False) -> int:
         if not sweep_only:
             curate()
         state = read_state()  # sweep advanced watermarks; re-read before stamping
-        state["last_curator_run"] = now().isoformat()
-        state["run_count"] = int(state.get("run_count", 0)) + 1
+        state["last_sweep_run"] = now().isoformat()
+        # A sweep-only run must not stamp the curate clock. Stamping it would
+        # push curation out by a full interval every day, so it would never
+        # run again.
+        if not sweep_only:
+            state["last_curator_run"] = now().isoformat()
+            state["run_count"] = int(state.get("run_count", 0)) + 1
         write_state(state)
     return 0
 
 
-def spawn_detached() -> None:
+def spawn_detached(sweep_only: bool = False) -> None:
     """Re-invoke ourselves with --run, fully detached.
 
     The SessionStart hook must return in milliseconds. Everything real happens
     in a process that outlives it.
     """
     subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--run"],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--sweep-only" if sweep_only else "--run",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
@@ -320,6 +369,11 @@ def show_status() -> int:
     print(f"Last curator run:  {state.get('last_curator_run', 'never')}")
     print(f"Run count:         {state.get('run_count', 0)}")
     print(f"Due now:           {due(state)}")
+    print()
+    print(f"Sweep interval:    {sweep_interval_hours(state)}h, "
+          f"up to {sweep_limit(state)} per run")
+    print(f"Last sweep run:    {state.get('last_sweep_run', 'never')}")
+    print(f"Sweep due now:     {sweep_due(state)}")
     print(f"Transcripts pending sweep: {len(queue)}")
     for path in queue[:10]:
         print(f"  {path.stem}  {path.parent.name}")
@@ -358,8 +412,12 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             pass
         try:
-            if due(read_state()):
+            state = read_state()
+            # The full run sweeps too, so never fork both.
+            if due(state):
                 spawn_detached()
+            elif sweep_due(state):
+                spawn_detached(sweep_only=True)
         except Exception as exc:  # noqa: BLE001
             review_mod.log({"event": "error", "reason": repr(exc)})
     return 0

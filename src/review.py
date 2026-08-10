@@ -43,6 +43,14 @@ MODEL = os.environ.get("CLAUDE_SELF_IMPROVE_MODEL", "sonnet")
 TIMEOUT_SECONDS = int(os.environ.get("CLAUDE_SELF_IMPROVE_TIMEOUT", "600"))
 MAX_TURNS = "30"
 
+#: How many times a transcript may fail before the loop stops retrying it.
+#: A failed review must be retried -- the first real failure in the wild was an
+#: account limit, which is transient by definition, and marking that session
+#: reviewed lost it permanently. But retrying forever is its own failure mode: a
+#: digest that reliably breaks the fork would burn one fork per sweep until it
+#: ages out. Three attempts, then let it go, loudly.
+MAX_ATTEMPTS = 3
+
 ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
 DENIED_TOOLS = ["Bash", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"]
 
@@ -80,6 +88,53 @@ def write_state(state: Dict[str, Any]) -> None:
     tmp.replace(STATE_FILE)
 
 
+def _mtime(transcript: Path) -> Optional[float]:
+    try:
+        return transcript.stat().st_mtime
+    except OSError:
+        return None
+
+
+def mark_reviewed(session_id: str, transcript: Path) -> None:
+    """Record that this transcript is done. Only ever called after a clean run."""
+    stamp = _mtime(transcript)
+    if stamp is None:
+        return
+    state = read_state()
+    state.setdefault("watermarks", {})[session_id] = stamp
+    state.get("attempts", {}).pop(session_id, None)
+    write_state(state)
+
+
+def mark_failed(session_id: str, transcript: Path, reason: str) -> bool:
+    """Count a failed review, leaving the transcript for the sweep to retry.
+
+    Returns True when the attempt budget is spent and the transcript has been
+    watermarked to stop the retries.
+    """
+    state = read_state()
+    attempts = state.setdefault("attempts", {})
+    count = int(attempts.get(session_id, 0) or 0) + 1
+    attempts[session_id] = count
+
+    exhausted = count >= MAX_ATTEMPTS
+    if exhausted:
+        attempts.pop(session_id, None)
+        stamp = _mtime(transcript)
+        if stamp is not None:
+            state.setdefault("watermarks", {})[session_id] = stamp
+        log(
+            {
+                "event": "gave-up",
+                "session": session_id,
+                "reason": reason,
+                "attempts": count,
+            }
+        )
+    write_state(state)
+    return exhausted
+
+
 def describe_writable() -> str:
     skills = guard.writable_skills()
     if not skills:
@@ -97,7 +152,7 @@ def describe_writable() -> str:
 
 def build_prompt(digest_text: str, cwd: str, session_id: str) -> str:
     template = (PROMPTS_DIR / "review.md").read_text(encoding="utf-8")
-    return (
+    return guard.FORK_MARKER + "\n\n" + (
         # The fork is pointed at the scratch copy, never the live library. It is
         # told so explicitly: a skill author who thinks their edit ships
         # immediately writes differently from one who knows it faces review.
@@ -239,6 +294,7 @@ def review(
             result = run_fork(prompt, cwd)
         except subprocess.TimeoutExpired:
             log({"event": "timeout", "session": session_id, "seconds": TIMEOUT_SECONDS})
+            mark_failed(session_id, transcript, "timeout")
             return 0
         except FileNotFoundError:
             log({"event": "error", "reason": "claude binary not found"})
@@ -273,9 +329,13 @@ def review(
             }
         )
 
-        state = read_state()
-        state.setdefault("watermarks", {})[session_id] = transcript.stat().st_mtime
-        write_state(state)
+        # Only a clean run counts as reviewed. A fork that died -- an account
+        # limit, a crash -- leaves the watermark alone so the sweep comes back
+        # to it, up to MAX_ATTEMPTS.
+        if result.returncode == 0:
+            mark_reviewed(session_id, transcript)
+        else:
+            mark_failed(session_id, transcript, f"exit {result.returncode}")
         return 0
 
 

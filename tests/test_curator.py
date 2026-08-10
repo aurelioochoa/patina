@@ -106,6 +106,35 @@ def test_custom_interval_respected(env):
     assert curator.due({"last_curator_run": recent, "interval_hours": 1})
 
 
+# --- sweep interval, independent of the curate interval ---------------------
+
+
+def test_sweep_due_when_never_swept(env):
+    assert curator.sweep_due({})
+
+
+def test_sweep_not_due_within_the_day(env):
+    recent = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)).isoformat()
+    assert not curator.sweep_due({"last_sweep_run": recent})
+
+
+def test_sweep_due_daily_even_when_curation_is_not(env):
+    """The bug: one weekly interval capped the sweep at `limit` per week."""
+    yesterday = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25)).isoformat()
+    state = {"last_sweep_run": yesterday, "last_curator_run": yesterday}
+    assert curator.sweep_due(state)
+    assert not curator.due(state)
+
+
+def test_pause_stops_the_sweep_too(env):
+    assert not curator.sweep_due({"paused": True})
+
+
+def test_sweep_limit_is_configurable(env):
+    assert curator.sweep_limit({"sweep_limit": 25}) == 25
+    assert curator.sweep_limit({"sweep_limit": "junk"}) == curator.DEFAULT_SWEEP_LIMIT
+
+
 # --- sweep selection -------------------------------------------------------
 
 
@@ -152,6 +181,53 @@ def test_sweep_advances_watermarks(env):
     make_stub(env.bin, "echo 'Nothing to save.'")
     curator.sweep({})
     assert "sess-a" in review_mod.read_state().get("watermarks", {})
+
+
+def test_sweep_ignores_the_loops_own_forks(env):
+    """A fork's transcript is a session too. Reviewing it feeds the review
+    prompt back into the review prompt."""
+    add_transcript(env, guard.project_slug(guard.WORK_DIR), "fork-a", age_minutes=60)
+    add_transcript(env, "proj", "sess-a", age_minutes=60)
+    assert [p.stem for p in curator.stale_transcripts({})] == ["sess-a"]
+
+
+def test_sweep_ignores_forks_from_an_earlier_work_tree(env):
+    """Rehearsal runs left transcripts under paths guard no longer knows."""
+    directory = env.projects / "-tmp-rehearsal-skills"
+    directory.mkdir(parents=True)
+    path = directory / "old-fork.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "queue-operation",
+                "content": "You are reviewing a finished Claude Code session to decide"
+                " what, if anything, is worth keeping.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    stamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).timestamp()
+    os.utime(path, (stamp, stamp))
+    assert curator.stale_transcripts({}) == []
+
+
+def test_sweep_keeps_a_session_that_merely_mentions_the_loop(env):
+    """The marker check reads the first record only, not the whole session."""
+    path = add_transcript(env, "proj", "sess-a", age_minutes=60)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            "\n"
+            + json.dumps(
+                {
+                    "type": "user",
+                    "cwd": "/home/u/proj",
+                    "message": {"role": "user", "content": guard.FORK_MARKER},
+                }
+            )
+        )
+    stamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).timestamp()
+    os.utime(path, (stamp, stamp))  # the append made it look like a live session
+    assert [p.stem for p in curator.stale_transcripts({})] == ["sess-a"]
 
 
 def test_transcript_cwd_extracted(env):
@@ -214,6 +290,11 @@ def test_curate_prompt_has_no_placeholders(env):
     assert "{inventory}" not in prompt and "{skills_dir}" not in prompt
 
 
+def test_curate_prompt_opens_with_the_fork_marker(env):
+    marked_skill(env, "learned")
+    assert curator.build_prompt().startswith(guard.FORK_MARKER)
+
+
 def test_curate_fork_carries_recursion_guards(env, monkeypatch):
     marked_skill(env, "learned")
     captured = {}
@@ -252,6 +333,23 @@ def test_run_preserves_sweep_watermarks(env):
     assert "sess-a" in review_mod.read_state().get("watermarks", {})
 
 
+def test_sweep_only_run_does_not_stamp_the_curate_clock(env):
+    """Otherwise a daily sweep pushes curation out a week, every day, forever."""
+    make_stub(env.bin, "echo ok")
+    curator.run(sweep_only=True)
+    state = review_mod.read_state()
+    assert state["last_sweep_run"]
+    assert "last_curator_run" not in state
+    assert curator.due(state)
+
+
+def test_full_run_stamps_both_clocks(env):
+    make_stub(env.bin, "echo ok")
+    curator.run()
+    state = review_mod.read_state()
+    assert state["last_sweep_run"] and state["last_curator_run"]
+
+
 def test_run_defers_when_locked(env):
     make_stub(env.bin, "echo ok")
     with guard.lock("curator"):
@@ -269,15 +367,31 @@ def test_check_forks_when_due(env, monkeypatch):
 
 
 def test_check_does_not_fork_when_recent(env, monkeypatch):
-    review_mod.write_state(
-        {"last_curator_run": dt.datetime.now(dt.timezone.utc).isoformat()}
-    )
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    review_mod.write_state({"last_curator_run": now, "last_sweep_run": now})
     spawned = []
-    monkeypatch.setattr(curator, "spawn_detached", lambda: spawned.append(True))
+    monkeypatch.setattr(curator, "spawn_detached", lambda **kw: spawned.append(kw))
     monkeypatch.setattr(sys, "argv", ["curator.py", "--check"])
     monkeypatch.setattr(sys, "stdin", type("S", (), {"read": lambda self: "{}"})())
     curator.main()
     assert not spawned
+
+
+def test_check_forks_sweep_only_when_curation_is_not_due(env, monkeypatch):
+    review_mod.write_state(
+        {
+            "last_curator_run": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "last_sweep_run": (
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25)
+            ).isoformat(),
+        }
+    )
+    spawned = []
+    monkeypatch.setattr(curator, "spawn_detached", lambda **kw: spawned.append(kw))
+    monkeypatch.setattr(sys, "argv", ["curator.py", "--check"])
+    monkeypatch.setattr(sys, "stdin", type("S", (), {"read": lambda self: "{}"})())
+    curator.main()
+    assert spawned == [{"sweep_only": True}]
 
 
 def test_check_exits_immediately_in_child(env, monkeypatch):

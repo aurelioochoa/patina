@@ -345,6 +345,61 @@ def test_timeout_is_logged_not_raised(env, monkeypatch):
     assert any(e["event"] == "timeout" for e in audit(env))
 
 
+# --- a failed review is retried, not silently swallowed ---------------------
+
+
+def watermarks() -> dict:
+    return review.read_state().get("watermarks", {})
+
+
+def attempts() -> dict:
+    return review.read_state().get("attempts", {})
+
+
+def test_successful_review_is_watermarked(env):
+    make_stub(env.bin, "echo 'Nothing to save.'")
+    review.review(env.transcript, "sess-ok", env.cwd)
+    assert "sess-ok" in watermarks()
+
+
+def test_failed_review_is_not_watermarked(env):
+    """The first real failure in the wild was an account limit — transient.
+
+    Watermarking it marked a 557-message session reviewed that never was.
+    """
+    make_stub(env.bin, "echo 'session limit' >&2; exit 1")
+    review.review(env.transcript, "sess-limit", env.cwd)
+    assert "sess-limit" not in watermarks()
+    assert attempts()["sess-limit"] == 1
+
+
+def test_timeout_is_not_watermarked(env, monkeypatch):
+    monkeypatch.setattr(review, "TIMEOUT_SECONDS", 1)
+    make_stub(env.bin, "sleep 30")
+    review.review(env.transcript, "sess-slow", env.cwd)
+    assert "sess-slow" not in watermarks()
+    assert attempts()["sess-slow"] == 1
+
+
+def test_retries_are_bounded(env):
+    """Retry forever and a transcript that always breaks burns a fork a day."""
+    make_stub(env.bin, "exit 1")
+    for _ in range(review.MAX_ATTEMPTS):
+        review.review(env.transcript, "sess-doomed", env.cwd)
+    assert "sess-doomed" in watermarks()
+    assert "sess-doomed" not in attempts()
+    assert any(e["event"] == "gave-up" for e in audit(env))
+
+
+def test_success_after_failure_clears_the_attempt_count(env):
+    make_stub(env.bin, "exit 1")
+    review.review(env.transcript, "sess-flaky", env.cwd)
+    make_stub(env.bin, "echo 'Nothing to save.'")
+    review.review(env.transcript, "sess-flaky", env.cwd)
+    assert "sess-flaky" in watermarks()
+    assert "sess-flaky" not in attempts()
+
+
 def test_empty_transcript_is_skipped(env):
     empty = env.tmp / "empty.jsonl"
     empty.write_text("", encoding="utf-8")
@@ -412,6 +467,12 @@ def test_prompt_has_no_unreplaced_placeholders(env):
     for token in ("{memory_dir}", "{skills_dir}", "{writable_skills}",
                   "{session_id}", "{today}", "{digest}"):
         assert token not in prompt
+
+
+def test_prompt_opens_with_the_fork_marker(env):
+    """The sweep recognises the loop's own transcripts by this line."""
+    prompt = review.build_prompt("DIGEST", env.cwd, "sess-12")
+    assert prompt.startswith(guard.FORK_MARKER)
 
 
 def test_prompt_lists_writable_skills(env):
