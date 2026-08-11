@@ -2,7 +2,7 @@
 name: patination
 description: Reviews the session you are in right now, mid-flight, and queues whatever skill it earns instead of waiting for the session to end.
 disable-model-invocation: true
-allowed-tools: Bash(ls *), Bash(patina review --transcript *), Bash(patina pending list), Bash(patina pending show *)
+allowed-tools: Bash(ls ~/.claude/projects/*), Bash(patina review --transcript *), Bash(patina pending list), Bash(patina pending show *)
 ---
 
 The loop normally waits for a session to close. This runs it against the session

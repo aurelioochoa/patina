@@ -21,6 +21,13 @@ PLUGIN_NAME = "patina"
 #: Every subcommand bin/patina dispatches. Skills and hooks may only use these.
 COMMANDS = {"review", "curator", "pending", "gate", "status"}
 
+#: The one class of grant that may sit outside `patina ...`: reading the
+#: transcript directory to find a live session. Path-bound and read-only, so it
+#: cannot reach a file the loop would not read anyway. Anything added here
+#: widens what a skill can run without asking -- keep it to rules that name
+#: their directory, and prefer a permission prompt to a new entry.
+READ_ONLY_EXCEPTIONS = {"Bash(ls ~/.claude/projects/*)"}
+
 
 def read_json(relative: str) -> dict:
     return json.loads((ROOT / relative).read_text(encoding="utf-8"))
@@ -136,7 +143,15 @@ def test_dispatcher_finds_scripts_in_the_flat_install_layout(tmp_path):
 
 def test_every_skill_exists_and_parses():
     names = {path.parent.name for path in skill_files()}
-    assert names == {"status", "pending", "approve", "reject", "curate", "pause"}
+    assert names == {
+        "status",
+        "pending",
+        "approve",
+        "reject",
+        "curate",
+        "pause",
+        "patination",
+    }
 
 
 @pytest.mark.parametrize("path", skill_files(), ids=lambda p: p.parent.name)
@@ -156,13 +171,19 @@ def test_skills_declare_a_description(path):
 
 @pytest.mark.parametrize("path", skill_files(), ids=lambda p: p.parent.name)
 def test_skills_only_pre_approve_patina_commands(path):
-    """A Bash grant wider than `patina ...` would hand the turn a general shell."""
+    """A Bash grant wider than `patina ...` would hand the turn a general shell.
+
+    READ_ONLY_EXCEPTIONS is the one narrow door out of that rule; everything
+    else must name a patina subcommand.
+    """
     frontmatter = path.read_text(encoding="utf-8").split("---")[1]
     for line in frontmatter.splitlines():
         if not line.startswith("allowed-tools:"):
             continue
         for rule in line.split(":", 1)[1].split(","):
             rule = rule.strip()
+            if rule in READ_ONLY_EXCEPTIONS:
+                continue
             assert rule.startswith("Bash(patina "), f"{path.parent.name}: {rule}"
             verb = rule[len("Bash(patina "):].split()[0].rstrip(")")
             assert verb in COMMANDS, f"{path.parent.name} pre-approves {verb!r}"
