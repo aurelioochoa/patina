@@ -1,0 +1,16 @@
+{
+  "name": "patina",
+  "description": "The patina self-improvement loop for Claude Code.",
+  "owner": {
+    "name": "aurelioochoa"
+  },
+  "plugins": [
+    {
+      "name": "patina",
+      "source": "./",
+      "description": "Background self-improvement loop: reviews finished sessions and proposes skill-library changes into a queue you approve.",
+      "category": "workflow",
+      "tags": ["skills", "memory", "self-improvement", "hooks"]
+    }
+  ]
+}
