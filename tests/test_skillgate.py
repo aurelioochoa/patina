@@ -38,7 +38,6 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(guard, "APPROVALS_FILE", tmp_path / "state" / "approvals.json")
     monkeypatch.setattr(guard, "PENDING_DIR", tmp_path / "state" / "pending")
     monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "work" / "skills")
-    monkeypatch.setattr(guard, "WORK_MEMORY", tmp_path / "work" / "memory")
     monkeypatch.setattr(guard, "PROJECTS_DIR", tmp_path / "projects")
     monkeypatch.setattr(guard, "LOCK_DIR", tmp_path / "state" / ".locks")
     return skills

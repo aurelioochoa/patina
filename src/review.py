@@ -41,7 +41,7 @@ STATE_FILE = guard.STATE_DIR / "state.json"
 
 MODEL = guard.env("MODEL", "sonnet")
 TIMEOUT_SECONDS = int(guard.env("TIMEOUT", "600"))
-MAX_TURNS = "30"
+MAX_TURNS = 30
 
 #: How many times a transcript may fail before the loop stops retrying it.
 #: A failed review must be retried -- the first real failure in the wild was an
@@ -51,8 +51,37 @@ MAX_TURNS = "30"
 #: ages out. Three attempts, then let it go, loudly.
 MAX_ATTEMPTS = 3
 
-ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
-DENIED_TOOLS = ["Bash", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"]
+#: Below both of these, a session is not reviewed at all.
+#:
+#: The review prompt pushes hard to find something worth keeping, which is what
+#: stops it defaulting to "Nothing to save." on sessions that did have a lesson.
+#: Aimed at a three-message session, that same pressure manufactures one. The
+#: gate is what makes the pressure safe: it applies only to sessions that did
+#: enough to have produced a lesson.
+#:
+#: Either signal alone is enough. A long conversation that touched no tools is
+#: exactly where preferences and corrections live; a heavy tool session with two
+#: user turns is where techniques live.
+DEFAULT_MIN_TOOL_CALLS = 8
+DEFAULT_MIN_USER_TURNS = 5
+
+
+def substance_gate(state: Dict[str, Any]) -> tuple:
+    def read(key: str, fallback: int) -> int:
+        try:
+            return max(0, int(state.get(key, fallback)))
+        except (TypeError, ValueError):
+            return fallback
+
+    return (
+        read("min_tool_calls", DEFAULT_MIN_TOOL_CALLS),
+        read("min_user_turns", DEFAULT_MIN_USER_TURNS),
+    )
+
+
+def is_thin(built: "digest_mod.Digest", state: Dict[str, Any]) -> bool:
+    min_tools, min_turns = substance_gate(state)
+    return built.tool_calls < min_tools and built.user_turns < min_turns
 
 
 def now() -> str:
@@ -106,6 +135,35 @@ def mark_reviewed(session_id: str, transcript: Path) -> None:
     write_state(state)
 
 
+def record_usage(session_id: str, transcript: Path, skills: list) -> None:
+    """Count the skills a session loaded.
+
+    The only feedback this loop has. Without it the curator ages skills on
+    wall-clock alone, which cannot tell a skill nobody needs from one that
+    quietly does its job every week, and ``--status`` can report how much was
+    written but never whether any of it was used.
+
+    Recorded for every session, including ones too thin to review -- using a
+    skill is evidence regardless of whether the session taught us anything.
+    """
+    if not skills:
+        return
+    state = read_state()
+    stamp = _mtime(transcript)
+    seen = state.setdefault("usage_seen", {})
+    if stamp is not None and seen.get(session_id) == stamp:
+        return  # already counted; a re-swept transcript must not count twice
+    usage = state.setdefault("usage", {})
+    stamped = now()
+    for name in skills:
+        row = usage.setdefault(name, {"count": 0, "last_used": None})
+        row["count"] = int(row.get("count", 0)) + 1
+        row["last_used"] = stamped
+    if stamp is not None:
+        seen[session_id] = stamp
+    write_state(state)
+
+
 def mark_failed(session_id: str, transcript: Path, reason: str) -> bool:
     """Count a failed review, leaving the transcript for the sweep to retry.
 
@@ -150,19 +208,112 @@ def describe_writable() -> str:
     return "\n".join(lines)
 
 
-def build_prompt(digest_text: str, cwd: str, session_id: str) -> str:
-    template = (PROMPTS_DIR / "review.md").read_text(encoding="utf-8")
+#: What the reflect pass must return. Structured output is not a formatting
+#: nicety here: it is what lets the loop branch on "did this session teach
+#: anything" without grepping prose for a phrase, and what lets each queued
+#: proposal carry the claim and evidence that motivated it.
+LESSONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "lessons": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["preference", "technique", "correction", "pitfall"],
+                    },
+                    "claim": {"type": "string"},
+                    "evidence": {"type": "string"},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                    "suggested_target": {"type": "string"},
+                },
+                "required": ["kind", "claim", "evidence", "confidence"],
+            },
+        },
+        "note": {"type": "string"},
+    },
+    "required": ["lessons"],
+}
+
+#: The reflect pass has no tools and one thing to say.
+REFLECT_MAX_TURNS = 3
+
+
+def build_reflect_prompt(digest_text: str, session_id: str) -> str:
+    template = (PROMPTS_DIR / "reflect.md").read_text(encoding="utf-8")
+    return guard.FORK_MARKER + "\n\n" + (
+        template.replace("{writable_skills}", describe_writable())
+        .replace("{session_id}", session_id or "unknown")
+        .replace("{digest}", digest_text)
+    )
+
+
+def render_lessons(lessons: list) -> str:
+    if not lessons:
+        return "(none)"
+    blocks = []
+    for index, lesson in enumerate(lessons, start=1):
+        target = str(lesson.get("suggested_target") or "").strip()
+        blocks.append(
+            f"{index}. [{lesson.get('kind', '?')}, "
+            f"confidence {lesson.get('confidence', '?')}] "
+            f"{lesson.get('claim', '').strip()}\n"
+            f"   Evidence: {str(lesson.get('evidence', '')).strip()}\n"
+            f"   Suggested home: {target or '(none suggested)'}"
+        )
+    return "\n\n".join(blocks)
+
+
+def build_place_prompt(lessons: list, session_id: str, note: str = "") -> str:
+    template = (PROMPTS_DIR / "place.md").read_text(encoding="utf-8")
+    rendered = render_lessons(lessons)
+    if note:
+        rendered += f"\n\nFrom the first pass: {note.strip()}"
     return guard.FORK_MARKER + "\n\n" + (
         # The fork is pointed at the scratch copy, never the live library. It is
         # told so explicitly: a skill author who thinks their edit ships
         # immediately writes differently from one who knows it faces review.
-        template.replace("{memory_dir}", str(guard.WORK_MEMORY))
-        .replace("{skills_dir}", str(guard.WORK_DIR))
+        template.replace("{skills_dir}", str(guard.WORK_DIR))
         .replace("{writable_skills}", describe_writable())
         .replace("{session_id}", session_id or "unknown")
-        .replace("{today}", dt.date.today().isoformat())
-        .replace("{digest}", digest_text)
+        .replace("{lessons}", rendered)
     )
+
+
+def extract_lessons(outcome: "guard.ForkResult") -> tuple:
+    """Pull the lesson list out of whatever the reflect fork returned.
+
+    Structured output is requested, so the normal path is a dict. The fallback
+    exists because a model told to emit JSON sometimes emits JSON in prose, and
+    losing a whole review to a stray code fence is a worse failure than parsing
+    loosely.
+    """
+    payload = outcome.structured
+    if not isinstance(payload, dict):
+        text = outcome.text.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text.split("\n", 1)[-1] if "\n" in text else text
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return [], ""
+    if not isinstance(payload, dict):
+        return [], ""
+    lessons = payload.get("lessons")
+    if not isinstance(lessons, list):
+        return [], str(payload.get("note") or "")
+    clean = [
+        lesson
+        for lesson in lessons
+        if isinstance(lesson, dict) and str(lesson.get("claim") or "").strip()
+    ]
+    return clean, str(payload.get("note") or "")
 
 
 _CREATED_FROM = re.compile(r"^(\s*createdFrom:).*$", re.MULTILINE)
@@ -214,37 +365,27 @@ def normalize_new_skills(session_id: str) -> None:
                 continue
 
 
-def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
+def run_fork(
+    prompt: str,
+    *,
+    tools: Optional[list] = None,
+    schema: Optional[Dict[str, Any]] = None,
+    max_turns: int = MAX_TURNS,
+) -> subprocess.CompletedProcess:
     """Spawn the restricted headless child.
 
     ``--add-dir`` is a harness-level boundary and the first line of defence;
     ``guard.verify_writes`` afterwards is the one that actually decides.
     """
-    memory = pending.prepare_work_memory(cwd)
     work = guard.WORK_DIR
-
-    command = [
-        "claude",
-        "-p",
+    command = guard.fork_command(
         prompt,
-        "--model",
-        MODEL,
-        "--settings",
-        guard.CHILD_SETTINGS,
-        "--strict-mcp-config",
-        "--permission-mode",
-        "acceptEdits",
-        "--max-turns",
-        MAX_TURNS,
-        "--add-dir",
-        str(work),
-        "--add-dir",
-        str(memory),
-        "--allowedTools",
-        *ALLOWED_TOOLS,
-        "--disallowedTools",
-        *DENIED_TOOLS,
-    ]
+        model=MODEL,
+        max_turns=max_turns,
+        add_dirs=[work] if tools != [] else [],
+        tools=tools,
+        schema=schema,
+    )
     return subprocess.run(
         command,
         cwd=str(work),
@@ -254,6 +395,25 @@ def run_fork(prompt: str, cwd: str) -> subprocess.CompletedProcess:
         env=guard.child_env(),
         check=False,
     )
+
+
+def _log_budget(session_id: str, returncode: int, outcome: "guard.ForkResult") -> None:
+    """Record a fork that stopped at the spend ceiling rather than crashing.
+
+    Retrying spends two more forks on a number that is too low, so this needs to
+    be visible in --status as its own thing, not filed as an unexplained failure.
+    """
+    if returncode != 0 and outcome.hit_budget:
+        log({
+            "event": "budget-exhausted",
+            "session": session_id,
+            "limit_usd": guard.MAX_BUDGET_USD,
+        })
+
+
+def _total_cost(*outcomes) -> Optional[float]:
+    known = [o.cost_usd for o in outcomes if o and o.cost_usd is not None]
+    return sum(known) if known else None
 
 
 def review(
@@ -268,17 +428,51 @@ def review(
         return 0
 
     cwd = built.cwd or cwd or str(Path.cwd())
-    pending.prepare_work_tree()
-    prompt = build_prompt(built.text, cwd, session_id)
+    state = read_state()
+    thin = is_thin(built, state)
 
     if dry_run:
-        print(prompt)
+        pending.prepare_work_tree()
+        example = [{
+            "kind": "preference",
+            "claim": "(what the first pass distils goes here)",
+            "evidence": "(a quote from the session)",
+            "confidence": "high",
+            "suggested_target": "",
+        }]
+        print("=" * 72 + "\n=== PASS 1: reflect (no tools)\n" + "=" * 72 + "\n")
+        print(build_reflect_prompt(built.text, session_id))
+        print("\n" + "=" * 72 + "\n=== PASS 2: place (runs only if pass 1 found "
+              "anything)\n" + "=" * 72 + "\n")
+        print(build_place_prompt(example, session_id))
+        min_tools, min_turns = substance_gate(state)
         print(
-            f"\n--- would fork: model={MODEL} messages={built.message_count} "
-            f"prompt={len(prompt)} chars truncated={built.truncated}",
+            f"\n--- gate: tool_calls={built.tool_calls} (min {min_tools}) "
+            f"user_turns={built.user_turns} (min {min_turns}) -> "
+            f"{'SKIP, too thin' if thin else 'review'}\n"
+            f"--- would fork: model={MODEL} messages={built.message_count} "
+            f"truncated={built.truncated}",
             file=sys.stderr,
         )
         return 0
+
+    record_usage(session_id, transcript, built.skills_loaded)
+
+    if thin:
+        log({
+            "event": "skipped",
+            "reason": "thin session",
+            "session": session_id,
+            "tool_calls": built.tool_calls,
+            "user_turns": built.user_turns,
+        })
+        # Watermarked: the session was considered and found too small. Leaving
+        # it unmarked would have the sweep reconsider it every day until it
+        # aged out, reaching the same conclusion each time.
+        mark_reviewed(session_id, transcript)
+        return 0
+
+    pending.prepare_work_tree()
 
     with guard.lock(f"review-{guard.project_slug(cwd)}") as acquired:
         if not acquired:
@@ -290,23 +484,93 @@ def review(
         guard.ensure_skills_repo()
         started = now()
 
+        # Pass 1: read the session, distil lessons, touch nothing. No tools and
+        # no --add-dir, so the pass that sees raw transcript text -- web pages,
+        # file contents, command output, anything a session happened to read --
+        # has no way to act on it. Only its structured findings go forward.
         try:
-            result = run_fork(prompt, cwd)
+            first = run_fork(
+                build_reflect_prompt(built.text, session_id),
+                tools=[],
+                schema=LESSONS_SCHEMA,
+                max_turns=REFLECT_MAX_TURNS,
+            )
         except subprocess.TimeoutExpired:
-            log({"event": "timeout", "session": session_id, "seconds": TIMEOUT_SECONDS})
+            log({"event": "timeout", "session": session_id, "pass": "reflect",
+                 "seconds": TIMEOUT_SECONDS})
             mark_failed(session_id, transcript, "timeout")
             return 0
         except FileNotFoundError:
             log({"event": "error", "reason": "claude binary not found"})
             return 0
 
+        reflected = guard.parse_fork_result(first.stdout)
+        _log_budget(session_id, first.returncode, reflected)
+        if first.returncode != 0:
+            log({"event": "reflect-failed", "session": session_id,
+                 "exit": first.returncode, "cost_usd": reflected.cost_usd,
+                 "stderr": (first.stderr or "")[:1000]})
+            mark_failed(session_id, transcript, f"reflect exit {first.returncode}")
+            return 0
+
+        lessons, note = extract_lessons(reflected)
+        if reflected.structured is None:
+            # The schema asked for structured output and the run succeeded, so
+            # its absence means the contract changed under us. Without this the
+            # symptom is every session reporting "nothing to save" forever --
+            # a loop that has silently stopped learning looks exactly like a
+            # library with nothing left to learn.
+            log({
+                "event": "reflect-unstructured",
+                "session": session_id,
+                "recovered": bool(lessons),
+            })
+
+        if not lessons:
+            # The session taught nothing. This is the common case and it costs
+            # one cheap tool-less pass, not a full write-capable fork.
+            log({
+                "event": "review",
+                "session": session_id,
+                "cwd": cwd,
+                "started": started,
+                "model": MODEL,
+                "messages": built.message_count,
+                "digest_chars": len(built.text),
+                "truncated": built.truncated,
+                "exit": 0,
+                "cost_usd": reflected.cost_usd,
+                "lessons": 0,
+                "queued": [],
+                "violations": [],
+                "reply": (note or "Nothing to save.")[:2000],
+            })
+            mark_reviewed(session_id, transcript)
+            return 0
+
+        # Pass 2: place the lessons. This one can write, and never sees the
+        # transcript.
+        try:
+            second = run_fork(build_place_prompt(lessons, session_id, note))
+        except subprocess.TimeoutExpired:
+            log({"event": "timeout", "session": session_id, "pass": "place",
+                 "seconds": TIMEOUT_SECONDS})
+            mark_failed(session_id, transcript, "timeout")
+            return 0
+        except FileNotFoundError:
+            log({"event": "error", "reason": "claude binary not found"})
+            return 0
+
+        result = second
+        outcome = guard.parse_fork_result(second.stdout)
+        _log_budget(session_id, second.returncode, outcome)
+
         # The fork never saw SKILLS_DIR, so there is nothing to revert there.
         # verify_writes stays as a cheap assertion that this remains true.
-        violations = guard.verify_writes(cwd)
-        reply = (result.stdout or "").strip()
+        violations = guard.verify_writes()
+        reply = outcome.text
         normalize_new_skills(session_id)
-        queued = pending.capture(session_id, summary=reply[:500])
-        memory_diff = pending.sync_memory(cwd)
+        queued = pending.capture(session_id, summary=reply[:500], claims=lessons)
         sha = None
 
         log(
@@ -320,10 +584,11 @@ def review(
                 "digest_chars": len(built.text),
                 "truncated": built.truncated,
                 "exit": result.returncode,
+                "cost_usd": _total_cost(reflected, outcome),
+                "lessons": len(lessons),
                 "commit": sha,
                 "queued": queued,
                 "violations": violations,
-                "memory": memory_diff,
                 "reply": reply[:2000],
                 "stderr": (result.stderr or "")[:1000] if result.returncode else "",
             }
@@ -352,26 +617,66 @@ def show_status() -> int:
 
     reviews = [e for e in entries if e.get("event") == "review"]
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
-    recent = [
-        e
-        for e in reviews
-        if _parse_time(e.get("at")) and _parse_time(e.get("at")) > cutoff
-    ]
+
+    def within_30_days(entry: Dict[str, Any]) -> bool:
+        stamp = _parse_time(entry.get("at"))
+        return bool(stamp and stamp > cutoff)
+
+    recent = [e for e in reviews if within_30_days(e)]
     violations = [e for e in reviews if e.get("violations")]
+    spend = sum(
+        float(e["cost_usd"])
+        for e in entries
+        if within_30_days(e) and isinstance(e.get("cost_usd"), (int, float))
+    )
+    budget_stops = [e for e in entries if e.get("event") == "budget-exhausted"]
 
     print(f"Total reviews:        {len(reviews)}")
     print(f"Last 30 days:         {len(recent)}")
     print(f"Last run:             {reviews[-1]['at'] if reviews else 'never'}")
+    print(f"Spend, last 30 days:  ${spend:.2f} (ceiling ${guard.MAX_BUDGET_USD}/fork)")
     print(f"Runs with violations: {len(violations)}")
     if violations:
         print("\nAllowlist violations (reverted):")
         for entry in violations[-5:]:
             for path in entry["violations"]:
                 print(f"  {entry['at']}  {path}")
+    if budget_stops:
+        print(
+            f"\n{len(budget_stops)} run(s) stopped at the spend ceiling. "
+            "Raise PATINA_MAX_USD or accept the truncation -- retrying will not help."
+        )
+    thin = [e for e in entries if e.get("reason") == "thin session"]
     nothing = sum(1 for e in reviews if "nothing to save" in (e.get("reply") or "").lower())
     print(f"\nNo-op reviews:        {nothing} of {len(reviews)}")
+    print(f"Skipped as too thin:  {len(thin)}")
     if reviews and nothing == len(reviews):
         print("  All reviews were no-ops. Check the prompt is reaching the model.")
+    unstructured = [e for e in entries if e.get("event") == "reflect-unstructured"]
+    if unstructured:
+        print(
+            f"  {len(unstructured)} run(s) returned no structured output. If that "
+            "is all of\n  them, --json-schema is not being honoured and every "
+            "review will read\n  as a no-op whether or not it found anything."
+        )
+
+    # The question this loop exists to answer. Everything above measures how
+    # hard it worked; this measures whether any of it landed.
+    usage = read_state().get("usage", {}) or {}
+    owned = [path.parent.name for path in guard.writable_skills()]
+    if owned:
+        used = [name for name in owned if (usage.get(name) or {}).get("count")]
+        print(f"\nSkills in the library: {len(owned)}")
+        print(f"Ever loaded since:     {len(used)}")
+        unused = sorted(set(owned) - set(used))
+        if unused:
+            print("Never loaded:          " + ", ".join(unused[:10]))
+            if len(unused) > 10:
+                print(f"                       and {len(unused) - 10} more")
+            print(
+                "  A skill nobody loads is usually a description problem, not a\n"
+                "  content problem. The curator sees these counts too."
+            )
     return 0
 
 

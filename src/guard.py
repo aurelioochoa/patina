@@ -8,8 +8,7 @@ Every other component imports this. Three jobs:
    the child.
 
 2. **Write confinement.** The fork may only touch skills carrying
-   ``metadata.autoManaged: true`` and the active project's memory directory.
-   Enforced at two layers -- ``--add-dir`` on the child (a harness boundary) and
+   ``metadata.autoManaged: true``. Enforced at two layers -- ``--add-dir`` on the child (a harness boundary) and
    :func:`verify_writes` afterwards (the actual security boundary). The prompt
    also lists the allowlist, but that is a courtesy to reduce wasted work, not a
    control. Prompt-level rules get ignored under pressure; the post-hoc check
@@ -26,7 +25,6 @@ that parses slightly less YAML.
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -80,7 +78,6 @@ PENDING_DIR = STATE_DIR / "pending"
 #: permission at all; our own Python moves approved content in afterwards.
 WORK_ROOT = Path(env("WORK_DIR") or (HOME / ".cache" / "patina"))
 WORK_DIR = WORK_ROOT / "skills"
-WORK_MEMORY = WORK_ROOT / "memory"
 
 #: Records which auto-created skills the user has blessed, and which they have
 #: refused. See skillgate.py.
@@ -133,6 +130,134 @@ def child_env() -> Dict[str, str]:
 #: Passed to every child. The second half of the recursion guard, and the
 #: reason a detached process beats a subagent: this is a real process boundary.
 CHILD_SETTINGS = json.dumps({"hooks": {"disableAllHooks": True}})
+
+
+# ---------------------------------------------------------------------------
+# The fork
+# ---------------------------------------------------------------------------
+
+#: What a fork may reach. Write access is scoped by ``--add-dir`` on top of
+#: this; the denials are what stop it reaching the network or shelling out.
+ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
+DENIED_TOOLS = ["Bash", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"]
+
+#: Hard ceiling per fork, in dollars. Turns and a timeout bound how *long* a
+#: fork runs, not what it costs: a single turn can be arbitrarily expensive, and
+#: a daily sweep multiplies whatever one review costs by its batch size.
+MAX_BUDGET_USD = env("MAX_USD", "0.50")
+
+#: Optional. Claude Code falls back when the primary model is overloaded or
+#: unavailable. Unset by default: a quieter model silently producing weaker
+#: skills is worse than a review that fails and gets retried.
+FALLBACK_MODEL = env("FALLBACK_MODEL", "")
+
+
+def fork_command(
+    prompt: str,
+    *,
+    model: str,
+    max_turns: int,
+    add_dirs: Iterable[Path] = (),
+    tools: Optional[List[str]] = None,
+    schema: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Argv for a headless child.
+
+    One place, because the two entry points had drifted into near-identical
+    twenty-line lists and a flag added to one was a flag missing from the other.
+
+    ``tools=[]`` means a pass that reads and writes nothing -- it only thinks.
+    ``schema`` forces structured output, which is what lets callers branch on
+    what the fork decided instead of grepping its prose for a phrase.
+    """
+    allowed = ALLOWED_TOOLS if tools is None else tools
+    command = [
+        "claude",
+        "-p",
+        prompt,
+        "--model",
+        model,
+        "--settings",
+        CHILD_SETTINGS,
+        "--strict-mcp-config",
+        "--permission-mode",
+        "acceptEdits",
+        "--max-turns",
+        str(max_turns),
+        "--output-format",
+        "json",
+        # The fork's own transcript is of no use to anyone and the sweep has to
+        # be taught to ignore it. Not writing one is simpler than excluding it.
+        "--no-session-persistence",
+    ]
+    if MAX_BUDGET_USD:
+        command += ["--max-budget-usd", str(MAX_BUDGET_USD)]
+    if FALLBACK_MODEL:
+        command += ["--fallback-model", FALLBACK_MODEL]
+    if schema is not None:
+        command += ["--json-schema", json.dumps(schema)]
+    for directory in add_dirs:
+        command += ["--add-dir", str(directory)]
+    if allowed:
+        command += ["--allowedTools", *allowed]
+    command += ["--disallowedTools", *DENIED_TOOLS]
+    return command
+
+
+class ForkResult:
+    """What a fork returned, whatever shape it came back in.
+
+    ``--output-format json`` is requested, but a CLI that changes its envelope
+    must degrade to "the reply is whatever it printed" rather than take the loop
+    offline. Everything here is best-effort except ``text``.
+    """
+
+    def __init__(self, text: str = "", structured: Any = None,
+                 cost_usd: Optional[float] = None, subtype: str = "") -> None:
+        self.text = text
+        self.structured = structured
+        self.cost_usd = cost_usd
+        self.subtype = subtype
+
+    @property
+    def hit_budget(self) -> bool:
+        """Did this fork stop because it ran out of money rather than ideas?
+
+        Worth distinguishing: a ceiling set too low fails every attempt, and
+        counting those as ordinary crashes spends the retry budget on a
+        configuration problem that retrying cannot fix.
+        """
+        haystack = f"{self.subtype} {self.text}".lower()
+        return "budget" in haystack and "exceed" in haystack or "max_budget" in haystack
+
+
+def parse_fork_result(stdout: str) -> ForkResult:
+    raw = (stdout or "").strip()
+    if not raw:
+        return ForkResult()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return ForkResult(text=raw)
+    if not isinstance(payload, dict):
+        return ForkResult(text=raw)
+    result = payload.get("result")
+    cost = payload.get("total_cost_usd")
+    if isinstance(result, str):
+        text = result.strip()
+    elif payload.get("is_error") or payload.get("subtype"):
+        # A failed run returns the envelope with no ``result`` at all. Falling
+        # back to the raw JSON here would log a screenful of usage counters as
+        # the fork's reply.
+        text = str(payload.get("errors") or "")
+    else:
+        text = raw
+    return ForkResult(
+        text=text,
+        structured=payload.get("structured_output"),
+        cost_usd=float(cost) if isinstance(cost, (int, float)) else None,
+        subtype=str(payload.get("subtype") or ""),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,11 +360,6 @@ def project_slug(cwd: str | Path) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
 
 
-def memory_dir(cwd: str | Path) -> Path:
-    """Per-project memory directory for a working directory."""
-    return PROJECTS_DIR / project_slug(cwd) / "memory"
-
-
 def own_project_slugs() -> Set[str]:
     """Project directory names Claude Code gives the loop's own trees.
 
@@ -247,7 +367,7 @@ def own_project_slugs() -> Set[str]:
     the project directory named after it. Deriving the slugs rather than
     hard-coding them keeps the rehearsal overrides working.
     """
-    return {project_slug(root) for root in (WORK_ROOT, WORK_DIR, WORK_MEMORY, SKILLS_DIR, STATE_DIR)}
+    return {project_slug(root) for root in (WORK_ROOT, WORK_DIR, SKILLS_DIR, STATE_DIR)}
 
 
 def is_own_transcript(path: Path) -> bool:
@@ -287,15 +407,14 @@ def writable_skills() -> List[Path]:
     return found
 
 
-def writable_roots(cwd: str | Path) -> Set[Path]:
+def writable_roots() -> Set[Path]:
     """Directories the fork may write inside.
 
-    Existing autoManaged skill directories, the skills root itself (so new
-    skills can be created), and the active project's memory directory.
+    Existing autoManaged skill directories and the skills root itself, so new
+    skills can be created.
     """
     roots = {skill.parent.resolve() for skill in writable_skills()}
     roots.add(SKILLS_DIR.resolve())
-    roots.add(memory_dir(cwd).resolve())
     return roots
 
 
@@ -307,14 +426,14 @@ def is_within(path: Path, roots: Iterable[Path]) -> bool:
     return any(resolved == root or root in resolved.parents for root in roots)
 
 
-def violates_allowlist(path: Path, cwd: str | Path) -> bool:
+def violates_allowlist(path: Path) -> bool:
     """Is this path outside the write surface?
 
     A new skill directory under ``SKILLS_DIR`` is allowed -- that is how skills
     get created. But a write to an *existing* skill that lacks the marker is a
     violation even though it sits under ``SKILLS_DIR``.
     """
-    roots = writable_roots(cwd)
+    roots = writable_roots()
     if not is_within(path, roots):
         return True
     resolved = path.resolve()
@@ -394,7 +513,7 @@ def changed_paths() -> List[tuple[str, Path]]:
     return entries
 
 
-def verify_writes(cwd: str | Path) -> List[str]:
+def verify_writes() -> List[str]:
     """Revert anything the fork wrote outside the allowlist.
 
     This is the security boundary. Returns the reverted paths so callers can log
@@ -403,7 +522,7 @@ def verify_writes(cwd: str | Path) -> List[str]:
     """
     violations: List[str] = []
     for status, path in changed_paths():
-        if not violates_allowlist(path, cwd):
+        if not violates_allowlist(path):
             continue
         violations.append(str(path))
         relative = str(path.relative_to(SKILLS_DIR))
@@ -426,34 +545,6 @@ def commit(message: str) -> Optional[str]:
     if result.returncode != 0:
         return None
     return head_sha()
-
-
-# ---------------------------------------------------------------------------
-# Memory snapshots
-#
-# The memory directory lives outside the audit repo, so git cannot police it.
-# Hash the tree before and after instead, and restore anything unexpected.
-# ---------------------------------------------------------------------------
-
-
-def snapshot_dir(directory: Path) -> Dict[str, str]:
-    if not directory.is_dir():
-        return {}
-    snapshot = {}
-    for path in sorted(directory.rglob("*")):
-        if path.is_file():
-            try:
-                snapshot[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
-                continue
-    return snapshot
-
-
-def diff_snapshot(before: Dict[str, str], after: Dict[str, str]) -> Dict[str, List[str]]:
-    added = sorted(set(after) - set(before))
-    removed = sorted(set(before) - set(after))
-    modified = sorted(p for p in set(before) & set(after) if before[p] != after[p])
-    return {"added": added, "removed": removed, "modified": modified}
 
 
 # ---------------------------------------------------------------------------

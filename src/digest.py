@@ -43,12 +43,21 @@ _METADATA_TYPES = {
 }
 
 
+#: Tools whose use means the session changed something, as opposed to reading
+#: around. Kept separate from the raw tool count because a long investigation
+#: that edits nothing can still carry a lesson worth keeping.
+_EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+
 @dataclass
 class Message:
     role: str
     text: str = ""
     tools: List[str] = field(default_factory=list)
     timestamp: Optional[str] = None
+    #: A user record carrying tool output rather than something the user typed.
+    #: Both arrive with ``role: user``; only one of them is a turn.
+    is_tool_result: bool = False
 
 
 @dataclass
@@ -62,6 +71,12 @@ class Digest:
     message_count: int = 0
     skipped_lines: int = 0
     truncated: bool = False
+    #: What the session actually did. The review gate reads these: forking a
+    #: model over a three-message session costs the same as forking over a real
+    #: one, and asks it to find a lesson that is not there.
+    tool_calls: int = 0
+    edit_calls: int = 0
+    user_turns: int = 0
 
 
 #: Slash-command and harness plumbing that carries no lesson. Stripped rather
@@ -109,17 +124,25 @@ def _extract(record: Dict[str, Any]) -> Optional[Message]:
 
     text_parts: List[str] = []
     tools: List[str] = []
+    spoken = False
+    tool_output = False
 
     if isinstance(content, str):
         text_parts.append(content)
+        spoken = True
     elif isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 tools.append(str(block.get("name") or "?"))
+                continue
+            chunk = _block_text(block)
+            if not chunk:
+                continue
+            text_parts.append(chunk)
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tool_output = True
             else:
-                chunk = _block_text(block)
-                if chunk:
-                    text_parts.append(chunk)
+                spoken = True
 
     text = clean(" ".join(p.strip() for p in text_parts if p and p.strip()))
     if not text and not tools:
@@ -129,6 +152,7 @@ def _extract(record: Dict[str, Any]) -> Optional[Message]:
         text=text,
         tools=tools,
         timestamp=record.get("timestamp"),
+        is_tool_result=tool_output and not spoken,
     )
 
 
@@ -215,6 +239,13 @@ def parse_transcript(path: str | Path) -> tuple[List[Message], Digest]:
 
     meta.skills_loaded = seen_skills
     meta.message_count = len(messages)
+    meta.tool_calls = sum(len(m.tools) for m in messages)
+    meta.edit_calls = sum(
+        1 for m in messages for name in m.tools if name in _EDIT_TOOLS
+    )
+    meta.user_turns = sum(
+        1 for m in messages if m.role == "user" and not m.is_tool_result
+    )
     return messages, meta
 
 
@@ -251,6 +282,8 @@ def render(
         f"cwd: {meta.cwd or 'unknown'}",
         f"git branch: {meta.git_branch or 'n/a'}",
         f"messages: {meta.message_count}",
+        f"user turns: {meta.user_turns}  tool calls: {meta.tool_calls}"
+        f"  file edits: {meta.edit_calls}",
     ]
     if meta.started:
         header.append(f"started: {meta.started}")

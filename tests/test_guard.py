@@ -7,6 +7,7 @@ corrupt skills the user wrote by hand.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -152,47 +153,31 @@ def test_writable_skills_empty_when_no_dir(tmp_path, monkeypatch):
 
 def test_new_skill_directory_is_allowed(skills):
     """Creating a skill is the point -- a path with no SKILL.md yet passes."""
-    assert not guard.violates_allowlist(skills / "brand-new" / "SKILL.md", "/home/u")
+    assert not guard.violates_allowlist(skills / "brand-new" / "SKILL.md")
 
 
 def test_existing_unmarked_skill_is_a_violation(skills):
     make_skill(skills, "unmarked", UNMARKED)
-    assert guard.violates_allowlist(skills / "unmarked" / "SKILL.md", "/home/u")
+    assert guard.violates_allowlist(skills / "unmarked" / "SKILL.md")
 
 
 def test_existing_marked_skill_is_allowed(skills):
     make_skill(skills, "marked", MARKED)
-    assert not guard.violates_allowlist(skills / "marked" / "SKILL.md", "/home/u")
+    assert not guard.violates_allowlist(skills / "marked" / "SKILL.md")
 
 
 def test_reference_file_under_marked_skill_allowed(skills):
     make_skill(skills, "marked", MARKED)
-    assert not guard.violates_allowlist(
-        skills / "marked" / "references" / "notes.md", "/home/u"
-    )
+    assert not guard.violates_allowlist(skills / "marked" / "references" / "notes.md")
 
 
 def test_reference_file_under_unmarked_skill_is_a_violation(skills):
     make_skill(skills, "unmarked", UNMARKED)
-    assert guard.violates_allowlist(
-        skills / "unmarked" / "references" / "notes.md", "/home/u"
-    )
+    assert guard.violates_allowlist(skills / "unmarked" / "references" / "notes.md")
 
 
 def test_path_outside_tree_is_a_violation(skills, tmp_path):
-    assert guard.violates_allowlist(tmp_path / "elsewhere" / "evil.md", "/home/u")
-
-
-def test_memory_dir_for_active_project_allowed(skills, tmp_path):
-    memory = guard.memory_dir("/home/u/proj")
-    memory.mkdir(parents=True)
-    assert not guard.violates_allowlist(memory / "fact.md", "/home/u/proj")
-
-
-def test_other_projects_memory_is_a_violation(skills, tmp_path):
-    other = guard.memory_dir("/home/u/other")
-    other.mkdir(parents=True)
-    assert guard.violates_allowlist(other / "fact.md", "/home/u/proj")
+    assert guard.violates_allowlist(tmp_path / "elsewhere" / "evil.md")
 
 
 # --- git audit repo --------------------------------------------------------
@@ -213,7 +198,7 @@ def test_ensure_repo_is_idempotent(repo):
 def test_verify_writes_reverts_new_unmarked_skill(repo):
     """The fork creating a skill without the marker must not survive."""
     make_skill(repo, "sneaky", UNMARKED)
-    violations = guard.verify_writes("/home/u")
+    violations = guard.verify_writes()
     assert len(violations) == 1
     assert not (repo / "sneaky" / "SKILL.md").exists()
 
@@ -222,7 +207,7 @@ def test_verify_writes_reverts_edit_to_unmarked_skill(repo):
     path = make_skill(repo, "handwritten", UNMARKED)
     guard.commit("baseline")
     path.write_text(UNMARKED + "\nCORRUPTED BY THE LOOP\n", encoding="utf-8")
-    violations = guard.verify_writes("/home/u")
+    violations = guard.verify_writes()
     assert len(violations) == 1
     assert "CORRUPTED" not in path.read_text(encoding="utf-8")
 
@@ -231,13 +216,13 @@ def test_verify_writes_keeps_marked_skill_edit(repo):
     path = make_skill(repo, "marked", MARKED)
     guard.commit("baseline")
     path.write_text(MARKED + "\nA genuine lesson.\n", encoding="utf-8")
-    assert guard.verify_writes("/home/u") == []
+    assert guard.verify_writes() == []
     assert "genuine lesson" in path.read_text(encoding="utf-8")
 
 
 def test_verify_writes_allows_new_marked_skill(repo):
     make_skill(repo, "learned", MARKED)
-    assert guard.verify_writes("/home/u") == []
+    assert guard.verify_writes() == []
     assert (repo / "learned" / "SKILL.md").exists()
 
 
@@ -270,31 +255,12 @@ def test_git_never_touches_the_real_skills_dir(repo, monkeypatch):
     monkeypatch.setattr(guard.subprocess, "run", spy)
     make_skill(repo, "learned", MARKED)
     guard.commit("learned something")
-    guard.verify_writes("/home/u")
+    guard.verify_writes()
 
     assert calls, "expected git invocations"
     for cwd in calls:
         assert str(repo) in str(cwd)
         assert str(guard.HOME / ".claude" / "skills") != str(cwd)
-
-
-# --- snapshots -------------------------------------------------------------
-
-
-def test_snapshot_detects_added_and_modified(tmp_path):
-    directory = tmp_path / "memory"
-    directory.mkdir()
-    (directory / "a.md").write_text("one", encoding="utf-8")
-    before = guard.snapshot_dir(directory)
-    (directory / "a.md").write_text("two", encoding="utf-8")
-    (directory / "b.md").write_text("new", encoding="utf-8")
-    diff = guard.diff_snapshot(before, guard.snapshot_dir(directory))
-    assert [Path(p).name for p in diff["modified"]] == ["a.md"]
-    assert [Path(p).name for p in diff["added"]] == ["b.md"]
-
-
-def test_snapshot_of_missing_dir_is_empty(tmp_path):
-    assert guard.snapshot_dir(tmp_path / "absent") == {}
 
 
 # --- locking ---------------------------------------------------------------
@@ -352,7 +318,7 @@ def test_work_dirs_are_outside_dot_claude():
     """
     fresh = _pristine_guard()
     claude_dir = (Path.home() / ".claude").resolve()
-    for name in ("WORK_ROOT", "WORK_DIR", "WORK_MEMORY"):
+    for name in ("WORK_ROOT", "WORK_DIR"):
         path = Path(getattr(fresh, name)).resolve()
         assert claude_dir not in path.parents and path != claude_dir, (
             f"guard.{name} is under ~/.claude; the fork cannot write there"
@@ -365,3 +331,90 @@ def test_pending_and_state_stay_inside_dot_claude():
     claude_dir = (Path.home() / ".claude").resolve()
     for name in ("STATE_DIR", "PENDING_DIR", "SKILLS_DIR"):
         assert claude_dir in Path(getattr(fresh, name)).resolve().parents
+
+
+# --- the fork command ------------------------------------------------------
+
+
+def test_fork_command_carries_the_recursion_and_spend_guards(skills):
+    command = guard.fork_command("prompt", model="sonnet", max_turns=30)
+    settings = json.loads(command[command.index("--settings") + 1])
+    assert settings["hooks"]["disableAllHooks"] is True
+    assert command[command.index("--max-budget-usd") + 1] == guard.MAX_BUDGET_USD
+    assert command[command.index("--output-format") + 1] == "json"
+    assert "--no-session-persistence" in command
+    assert "--strict-mcp-config" in command
+
+
+def test_fork_command_always_denies_the_dangerous_tools(skills):
+    command = guard.fork_command("prompt", model="sonnet", max_turns=30, tools=[])
+    denied = command[command.index("--disallowedTools") + 1:]
+    for tool in ("Bash", "WebFetch", "WebSearch"):
+        assert tool in denied
+    # A pass with no tools gets no --allowedTools list and no directory.
+    assert "--allowedTools" not in command
+    assert "--add-dir" not in command
+
+
+def test_fork_command_omits_fallback_model_unless_configured(skills):
+    assert "--fallback-model" not in guard.fork_command(
+        "prompt", model="sonnet", max_turns=30
+    )
+
+
+def test_fork_command_passes_a_schema_as_json(skills):
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    command = guard.fork_command("p", model="sonnet", max_turns=1, schema=schema)
+    assert json.loads(command[command.index("--json-schema") + 1]) == schema
+
+
+# --- reading what the fork returned ----------------------------------------
+
+
+def test_parse_fork_result_reads_the_json_envelope():
+    stdout = json.dumps({
+        "result": "  Nothing to save.  ",
+        "structured_output": {"lessons": []},
+        "total_cost_usd": 0.0123,
+        "subtype": "success",
+    })
+    outcome = guard.parse_fork_result(stdout)
+    assert outcome.text == "Nothing to save."
+    assert outcome.structured == {"lessons": []}
+    assert outcome.cost_usd == 0.0123
+
+
+def test_parse_fork_result_falls_back_to_plain_text():
+    """A CLI that changes its envelope must degrade, not take the loop down."""
+    outcome = guard.parse_fork_result("just some prose\n")
+    assert outcome.text == "just some prose"
+    assert outcome.structured is None and outcome.cost_usd is None
+
+
+def test_parse_fork_result_handles_empty_output():
+    assert guard.parse_fork_result("").text == ""
+    assert guard.parse_fork_result(None).text == ""
+
+
+def test_budget_exhaustion_is_distinguishable_from_a_crash():
+    hit = guard.parse_fork_result(
+        json.dumps({"subtype": "error_max_budget", "result": "stopped"})
+    )
+    assert hit.hit_budget
+    assert not guard.parse_fork_result(json.dumps({"result": "fine"})).hit_budget
+
+
+def test_parse_fork_result_does_not_echo_an_error_envelope_as_the_reply():
+    """A failed run has no `result` key at all; falling back to the raw JSON
+    logged a screenful of usage counters as the fork's reply."""
+    stdout = json.dumps({
+        "type": "result",
+        "subtype": "error_max_budget_usd",
+        "is_error": True,
+        "total_cost_usd": 0.22,
+        "usage": {"input_tokens": 2},
+    })
+    outcome = guard.parse_fork_result(stdout)
+    assert outcome.text == ""
+    assert outcome.hit_budget
+    assert outcome.cost_usd == 0.22

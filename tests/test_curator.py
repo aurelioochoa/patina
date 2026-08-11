@@ -35,7 +35,6 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(review_mod, "STATE_FILE", tmp_path / "state" / "state.json")
     monkeypatch.setattr(guard, "PENDING_DIR", tmp_path / "state" / "pending")
     monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "work" / "skills")
-    monkeypatch.setattr(guard, "WORK_MEMORY", tmp_path / "work" / "memory")
     monkeypatch.setattr(guard, "APPROVALS_FILE", tmp_path / "state" / "approvals.json")
 
     bin_dir = tmp_path / "bin"
@@ -434,6 +433,115 @@ def test_curator_changes_are_queued_not_applied(env):
     assert queue[0]["session"].startswith("curator-")
 
 
+def test_curator_archive_is_queued_as_its_own_kind(env):
+    """The bug: an archive move landed as a pending entry named `archive`,
+    which on approval replaced the whole archive directory and left the
+    original skill live. Both of the curator's main actions were no-ops."""
+    import pending
+
+    marked_skill(env, "learned")
+    make_stub(env.bin, (
+        f"mkdir -p '{guard.WORK_DIR}/archive'\n"
+        f"mv '{guard.WORK_DIR}/learned' '{guard.WORK_DIR}/archive/learned'\n"
+        "echo 'archived learned'"
+    ))
+    curator.curate()
+
+    queue = pending.entries()
+    assert len(queue) == 1
+    assert queue[0]["kind"] == pending.KIND_ARCHIVE
+    assert queue[0]["skill"] == "learned"
+    assert (env.skills / "learned" / "SKILL.md").exists()  # not yet applied
+
+
+def test_approving_an_archive_moves_the_live_skill(env):
+    import pending
+
+    marked_skill(env, "learned")
+    guard.ensure_skills_repo()
+    guard.commit("baseline")
+    (env.skills / "archive").mkdir()
+    (env.skills / "archive" / "older").mkdir()
+    (env.skills / "archive" / "older" / "SKILL.md").write_text("kept", encoding="utf-8")
+
+    make_stub(env.bin, (
+        f"mkdir -p '{guard.WORK_DIR}/archive'\n"
+        f"mv '{guard.WORK_DIR}/learned' '{guard.WORK_DIR}/archive/learned'\n"
+        "echo archived"
+    ))
+    curator.curate()
+    assert pending.approve(pending.entries()[0]["id"])
+
+    assert not (env.skills / "learned").exists()
+    assert (env.skills / "archive" / "learned" / "SKILL.md").exists()
+    # A previously archived skill must survive the move.
+    assert (env.skills / "archive" / "older" / "SKILL.md").read_text() == "kept"
+    # Archiving is not a verdict on the skill's content.
+    assert pending.approval_for("learned") is None
+
+
+def test_archiving_an_unowned_skill_is_dropped(env):
+    import pending
+    from test_review import UNMARKED
+
+    handwritten = env.skills / "mine"
+    handwritten.mkdir()
+    (handwritten / "SKILL.md").write_text(UNMARKED.format(name="mine"), encoding="utf-8")
+    marked_skill(env, "learned")
+
+    make_stub(env.bin, (
+        f"mkdir -p '{guard.WORK_DIR}/archive'\n"
+        f"mv '{guard.WORK_DIR}/mine' '{guard.WORK_DIR}/archive/mine'\n"
+        "echo archived"
+    ))
+    curator.curate()
+
+    assert pending.entries() == []
+    assert (handwritten / "SKILL.md").exists()
+
+
+def test_consolidation_deletions_are_captured(env):
+    """Merging the narrower skill into the broader one means removing files.
+    Walking only the work tree made that invisible: the additions queued and
+    the duplicate content stayed."""
+    import pending
+
+    path = marked_skill(env, "learned")
+    references = path.parent / "references"
+    references.mkdir()
+    (references / "absorbed.md").write_text("moved into SKILL.md", encoding="utf-8")
+
+    make_stub(env.bin, (
+        f"rm '{guard.WORK_DIR}/learned/references/absorbed.md'\n"
+        "echo consolidated"
+    ))
+    curator.curate()
+
+    queue = pending.entries()
+    assert len(queue) == 1 and queue[0]["kind"] == "patch"
+    assert "learned/references/absorbed.md" in queue[0]["files"]
+    diff = (guard.PENDING_DIR / queue[0]["id"] / "diff.txt").read_text(encoding="utf-8")
+    assert "-moved into SKILL.md" in diff
+
+    assert pending.approve(queue[0]["id"])
+    assert not (references / "absorbed.md").exists()
+    assert (env.skills / "learned" / "SKILL.md").exists()
+
+
+def test_whole_skill_deletion_is_dropped_not_queued(env):
+    """The curator is told it never deletes. Approving a deletion is the one
+    action the queue cannot take back."""
+    import pending
+
+    marked_skill(env, "learned")
+    make_stub(env.bin, f"rm -rf '{guard.WORK_DIR}/learned'\necho deleted")
+    curator.curate()
+
+    assert pending.entries() == []
+    assert (env.skills / "learned" / "SKILL.md").exists()
+    assert any(e["event"] == "dropped-deletion" for e in audit(env))
+
+
 def test_curator_cannot_touch_hand_written_skills(env):
     import pending
 
@@ -449,3 +557,92 @@ def test_curator_cannot_touch_hand_written_skills(env):
 
     assert (handwritten / "SKILL.md").read_text(encoding="utf-8") == original
     assert pending.entries() == []
+
+
+def test_inventory_carries_usage_counts(env):
+    """Age alone cannot tell a skill nobody needs from one that quietly works."""
+    marked_skill(env, "learned")
+    marked_skill(env, "ignored")
+    review_mod.write_state(
+        {"usage": {"learned": {"count": 4, "last_used": "2026-08-01T00:00:00+00:00"}}}
+    )
+    text = curator.inventory()
+    assert "used 4x, last 2026-08-01" in text
+    assert "never used" in text
+
+
+def test_curator_report_is_structured(env):
+    """--status should say what it did, not quote a paragraph at the reader."""
+    marked_skill(env, "learned")
+    report = json.dumps({
+        "type": "result",
+        "result": "",
+        "structured_output": {
+            "actions": [{"kind": "archived", "skill": "learned", "reason": "never used"}],
+            "largest_risk": "learned and lore overlap",
+        },
+        "total_cost_usd": 0.01,
+    }).replace("'", "'\\''")
+    make_stub(env.bin, f"printf '%s' '{report}'")
+    curator.curate()
+
+    entry = [e for e in audit(env) if e["event"] == "curate"][0]
+    assert entry["actions"][0]["skill"] == "learned"
+    assert entry["largest_risk"] == "learned and lore overlap"
+    # The reply reads as a sentence, not as the JSON the schema produced.
+    assert "archived learned" in entry["reply"]
+    assert "{" not in entry["reply"]
+
+
+def test_the_audit_repo_is_not_mistaken_for_a_deleted_skill(env):
+    """The .git directory lives in the skills tree and is deliberately not
+    copied into the work tree, so every file under it looks like a skill whose
+    files the fork removed."""
+    import pending
+
+    marked_skill(env, "learned")
+    guard.ensure_skills_repo()
+    guard.commit("baseline")
+
+    make_stub(env.bin, "echo 'no changes'")
+    curator.curate()
+
+    assert not any(e["event"] == "dropped-deletion" for e in audit(env))
+    assert pending.entries() == []
+
+
+def test_curate_only_does_not_sweep(env):
+    """A rehearsal aimed at the curator would otherwise fork a batch of real
+    reviews first: the sweep reads PATINA_PROJECTS_DIR, which stays pointed at
+    the real ~/.claude/projects even when skills and state are redirected."""
+    add_transcript(env, "proj", "sess-a", age_minutes=60)
+    marked_skill(env, "learned")
+    make_stub(env.bin, "echo 'no changes'")
+
+    curator.run(curate_only=True)
+
+    assert not any(e["event"] == "review" for e in audit(env))
+    assert "sess-a" not in review_mod.read_state().get("watermarks", {})
+    assert any(e["event"] == "curate" for e in audit(env))
+    assert "last_sweep_run" not in review_mod.read_state()
+
+
+def test_an_archive_supersedes_an_edit_to_the_same_skill(env):
+    """The fork has no tool that can move a directory, so it is asked to write
+    the copy under archive/ and leave the original alone. When it stubs out the
+    original anyway, that is a second contradictory change against a skill
+    already on its way out."""
+    import pending
+
+    marked_skill(env, "learned")
+    make_stub(env.bin, (
+        f"mkdir -p '{guard.WORK_DIR}/archive/learned'\n"
+        f"cp '{guard.WORK_DIR}/learned/SKILL.md' '{guard.WORK_DIR}/archive/learned/'\n"
+        f"echo 'ARCHIVED STUB' >> '{guard.WORK_DIR}/learned/SKILL.md'\n"
+        "echo archived"
+    ))
+    curator.curate()
+
+    queue = pending.entries()
+    assert [e["kind"] for e in queue] == [pending.KIND_ARCHIVE]
+    assert any(e["event"] == "superseded-by-archive" for e in audit(env))

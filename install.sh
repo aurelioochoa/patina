@@ -55,6 +55,9 @@ install_scripts() {
   mkdir -p "$TARGET/prompts"
   cp "$SOURCE_DIR"/src/*.py "$TARGET/"
   cp "$SOURCE_DIR"/src/prompts/*.md "$TARGET/prompts/"
+  # The single review prompt became reflect.md + place.md. Copying does not
+  # remove it, and a leftover prompt nothing reads is a thing to trip over.
+  rm -f "$TARGET/prompts/review.md"
   chmod +x "$TARGET/review.py" "$TARGET/curator.py"
   ok "scripts installed"
 

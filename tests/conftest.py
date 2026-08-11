@@ -29,7 +29,6 @@ GUARDED = (
     "LOCK_DIR",
     "PENDING_DIR",
     "WORK_DIR",
-    "WORK_MEMORY",
     "APPROVALS_FILE",
 )
 
