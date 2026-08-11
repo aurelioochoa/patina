@@ -21,6 +21,34 @@ which added the two-pass review and the usage signal.
 
 ## Install
 
+Two ways. The plugin is the one to reach for.
+
+### As a plugin
+
+```sh
+claude --plugin-dir /path/to/patina        # try it for one session
+```
+
+The plugin carries the hooks and the commands, so nothing edits your
+`settings.json`, and `/plugin` enables, disables and removes it. `bin/patina`
+resolves `src/` from its own path, so the plugin directory is self-contained.
+
+| Command | Does |
+|---|---|
+| `/patina:status` | is the loop running, what does it cost, is any of it used |
+| `/patina:pending` | what it wants to change |
+| `/patina:approve <id>` | apply one, or `--all` |
+| `/patina:reject <id>` | discard one |
+| `/patina:curate` | run the curator now |
+| `/patina:pause` | stop the scheduled work (`resume` to restart) |
+
+All six carry `disable-model-invocation: true`, so only you can run them. That is
+deliberate rather than tidy: they spend money and change what loads into every
+later session, and a model free to invoke `/patina:approve --all` on its own
+defeats the queue those commands exist to serve.
+
+### As scripts
+
 ```sh
 ./install.sh                  # copy scripts to ~/.claude/patina, init audit repo
 ```
@@ -54,6 +82,13 @@ when the curator is what you meant to exercise.
 
 `./install.sh --uninstall` removes the scripts and hooks and leaves your skills
 and their git history alone.
+
+Do not do both. The plugin ships the same three hooks, so registering them in
+`settings.json` as well fires each one twice per session — the loop survives it
+(the review lock defers the duplicate) but the sweep can then start twice as many
+forks, and a doubled spend ceiling is not a ceiling. `--register-hooks` detects an
+installed plugin and refuses; a plugin loaded with `--plugin-dir` leaves no trace
+on disk, so that case is on you.
 
 ## Two passes
 

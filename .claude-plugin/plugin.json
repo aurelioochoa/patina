@@ -1,0 +1,9 @@
+{
+  "name": "patina",
+  "description": "Background self-improvement loop: reviews finished sessions and proposes skill-library changes into a queue you approve.",
+  "version": "0.2.0",
+  "author": {
+    "name": "aurelioochoa"
+  },
+  "license": "MIT"
+}

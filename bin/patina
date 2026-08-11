@@ -1,0 +1,62 @@
+#!/bin/sh
+# One entry point for every patina script.
+#
+# This exists so the Bash tool sees a bare `patina` command. Claude Code puts a
+# plugin's bin/ on PATH while the plugin is enabled, which lets a skill
+# pre-approve exactly what it needs with `allowed-tools: Bash(patina status)`.
+# Absolute paths cannot do that job: ${CLAUDE_PLUGIN_ROOT} is substituted in
+# skill bodies and hook commands but NOT in allowed-tools rules, so a rule
+# written against a path would never match the command that runs.
+#
+# Locating the scripts from $0 rather than from ${CLAUDE_PLUGIN_ROOT} keeps this
+# working when it is run outside a plugin context -- by hand, from install.sh's
+# copy in ~/.claude/patina, or from a hook.
+set -eu
+
+self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# Layout when run from the repo or a plugin install: <root>/bin/patina next to
+# <root>/src/*.py. Layout when installed by install.sh: everything flat in
+# ~/.claude/patina.
+if [ -f "$self_dir/../src/review.py" ]; then
+    src=$(CDPATH= cd -- "$self_dir/../src" && pwd)
+elif [ -f "$self_dir/review.py" ]; then
+    src=$self_dir
+else
+    echo "patina: cannot find the scripts relative to $self_dir" >&2
+    exit 1
+fi
+
+usage() {
+    cat >&2 <<EOF
+usage: patina <command> [args...]
+
+  review [args]     review a session; no args is hook mode, reading stdin
+  curator [args]    sweep and curation entry point
+  pending [args]    the approval queue: list, show, approve, reject
+  gate              PreToolUse backstop for the Skill tool
+  status            everything: intervals, sweep backlog, spend, usage
+
+Everything after the command is passed through untouched, so
+\`patina pending approve --all\` is \`pending.py approve --all\`.
+EOF
+    exit 64
+}
+
+[ $# -ge 1 ] || usage
+command=$1
+shift
+
+case "$command" in
+    review)  exec python3 "$src/review.py" "$@" ;;
+    curator) exec python3 "$src/curator.py" "$@" ;;
+    pending) exec python3 "$src/pending.py" "$@" ;;
+    gate)    exec python3 "$src/skillgate.py" "$@" ;;
+    # curator --status ends by calling the review report, so this is both.
+    status)  exec python3 "$src/curator.py" --status ;;
+    -h|--help|help) usage ;;
+    *)
+        echo "patina: unknown command '$command'" >&2
+        usage
+        ;;
+esac

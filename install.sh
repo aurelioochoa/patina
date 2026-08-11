@@ -10,6 +10,9 @@
 #   ./install.sh                  # install scripts, init audit repo
 #   ./install.sh --register-hooks # wire into settings.json (do this last)
 #   ./install.sh --uninstall      # remove scripts and hooks, keep skills
+#
+# If you installed the plugin instead, it carries the same three hooks and
+# --register-hooks will refuse rather than register them twice.
 set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -97,9 +100,44 @@ Find transcripts under: $CLAUDE_DIR/projects/<project-slug>/*.jsonl
 EOF
 }
 
+# The same three hooks ship inside the plugin, so registering them here as well
+# fires each one twice per session. The loop survives that -- the review lock
+# defers the second, and the watermark makes it a no-op -- but it doubles the
+# forks the sweep can start, and a doubled spend ceiling is not a ceiling.
+#
+# A plugin loaded with --plugin-dir for development leaves no trace on disk, so
+# this catches the installed case only. Hence a warning with an override rather
+# than a hard refusal.
+plugin_is_installed() {
+  python3 - "$CLAUDE_DIR" <<'PY'
+import json, pathlib, sys
+
+root = pathlib.Path(sys.argv[1]) / "plugins"
+for manifest in root.rglob(".claude-plugin/plugin.json"):
+    try:
+        if json.loads(manifest.read_text()).get("name") == "patina":
+            print(manifest.parent.parent)
+            raise SystemExit(0)
+    except (OSError, json.JSONDecodeError):
+        continue
+raise SystemExit(1)
+PY
+}
+
 register_hooks() {
   [ -f "$SETTINGS" ] || die "no settings.json at $SETTINGS"
   [ -x "$TARGET/review.py" ] || die "run ./install.sh first"
+
+  if found=$(plugin_is_installed); then
+    if [ "${FORCE:-0}" != "1" ]; then
+      warn "the patina plugin is already installed at:"
+      info "  $found"
+      info "It registers these same hooks, so doing both fires each twice."
+      info "Manage hooks with /plugin instead, or re-run with --force."
+      die "refusing to double-register"
+    fi
+    warn "plugin present but --force given; hooks will fire twice"
+  fi
 
   cp "$SETTINGS" "$SETTINGS.bak.$(date +%Y%m%d_%H%M%S)"
   ok "backed up settings.json"
@@ -175,6 +213,11 @@ PY
   ok "scripts removed"
   warn "left alone: $SKILLS (your skills and their git history)"
 }
+
+FORCE=0
+if [ "${2:-}" = "--force" ]; then
+  FORCE=1
+fi
 
 case "${1:-}" in
   --register-hooks) register_hooks ;;
