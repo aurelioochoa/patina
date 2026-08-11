@@ -89,6 +89,7 @@ That's it. The loop starts working at the end of your next session.
 | `/patina:pending` | What it wants to change |
 | `/patina:approve <id>` | Apply one — or `--all` if you're feeling brave |
 | `/patina:reject <id>` | Discard one |
+| `/patina:patination` | Review the session you're in right now, without waiting for it to end |
 | `/patina:curate` | Tidy the library now, instead of waiting for the weekly pass |
 | `/patina:pause` | Stop the scheduled work (`resume` to start again) |
 
@@ -101,7 +102,11 @@ point of having a queue.
 
 ## How it works
 
+<img src="assets/loop.jpg" alt="A diagram engraved into a verdigris copper plate: six boxes in a ring — SESSION, REFLECT, PLACE, QUEUE, LIBRARY, CURATOR — joined by arrows flowing clockwise into a closed loop." width="100%">
+
 ### Two passes, and the split matters
+
+<img src="assets/two-passes.jpg" alt="A diagram engraved into a copper plate: SESSION to REFLECT on the left, PLACE to QUEUE on the right, with a slot cut clean through the metal between them. A copper tag labelled LESSONS bridges the gap — the only thing that crosses." width="100%">
 
 A review is two separate forks, not one.
 
@@ -121,6 +126,8 @@ description gets injected into the system prompt of every session afterwards. Fe
 prompt asks a model not to be fooled. This arranges for it never to be asked.
 
 ### Nothing goes live unreviewed
+
+<img src="assets/queue.jpg" alt="A diagram engraved into a verdigris copper plate: a box labelled QUEUE forking into two paths that never rejoin — up through APPROVE to LIBRARY, down through REJECT to DISCARD." width="100%">
 
 Neither fork can reach your real skill library. Both write into a scratch copy and aren't
 even told where the real one is. Afterwards, every difference is filed for you to approve or
@@ -331,19 +338,11 @@ stale.
 Full detail in [the original design](docs/superpowers/specs/2026-08-07-claude-self-improvement-loop-design.md)
 and [the 2026-08-10 amendment](docs/superpowers/specs/2026-08-10-two-pass-review-and-measured-library.md).
 
-## A note on memory
+## Images
 
-patina doesn't touch memory. Claude Code's own auto-memory writes to
-`~/.claude/projects/<slug>/memory/`, which is where this loop used to write too — two writers
-on one directory with no merge protocol between them. That ground is better held by the
-feature that ships with the harness. patina does skills.
-
-## Layout
-
-Source lives here. Runtime state lives in `~/.claude/patina/` and is never committed.
-
-The banner was generated with Higgsfield; the prompts and the notes on regenerating it are in
-[`assets/banner-prompt.md`](assets/banner-prompt.md).
+Every image here was generated with Higgsfield. The prompts, the reasoning behind each one,
+and the notes on regenerating them are in
+[`assets/image-prompts.md`](assets/image-prompts.md).
 
 ---
 
@@ -419,6 +418,7 @@ Listo. El proceso empieza a trabajar al final de tu siguiente sesión.
 | `/patina:pending` | Qué quiere cambiar |
 | `/patina:approve <id>` | Aplicar uno, o `--all` para todos |
 | `/patina:reject <id>` | Descartar uno |
+| `/patina:patination` | Revisar la sesión en curso, sin esperar a que termine |
 | `/patina:curate` | Ordenar la biblioteca ahora, sin esperar a la pasada semanal |
 | `/patina:pause` | Detener el trabajo programado (`resume` para reanudar) |
 
