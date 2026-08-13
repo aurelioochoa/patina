@@ -27,7 +27,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -164,15 +164,23 @@ def record_usage(session_id: str, transcript: Path, skills: list) -> None:
     write_state(state)
 
 
-def mark_failed(session_id: str, transcript: Path, reason: str) -> bool:
+def mark_failed(
+    session_id: str, transcript: Path, reason: str, terminal: bool = False
+) -> bool:
     """Count a failed review, leaving the transcript for the sweep to retry.
 
     Returns True when the attempt budget is spent and the transcript has been
     watermarked to stop the retries.
+
+    ``terminal`` spends the whole budget at once, for a failure where the next
+    attempt is guaranteed to fail the same way -- a spend ceiling below what
+    this transcript costs is the case in the wild. Retrying that is not
+    resilience, it is paying the ceiling twice more to learn what the first run
+    already established.
     """
     state = read_state()
     attempts = state.setdefault("attempts", {})
-    count = int(attempts.get(session_id, 0) or 0) + 1
+    count = MAX_ATTEMPTS if terminal else int(attempts.get(session_id, 0) or 0) + 1
     attempts[session_id] = count
 
     exhausted = count >= MAX_ATTEMPTS
@@ -193,19 +201,65 @@ def mark_failed(session_id: str, transcript: Path, reason: str) -> bool:
     return exhausted
 
 
-def describe_writable() -> str:
-    skills = guard.writable_skills()
-    if not skills:
-        return (
-            "(none yet — the library is empty. Create the first class-level "
-            "skill if this session earned one.)"
-        )
-    lines = []
-    for path in skills:
+def _describe(path: Path, suffix: str = "") -> str:
+    try:
         frontmatter = guard.parse_frontmatter(path.read_text(encoding="utf-8"))
-        description = str(frontmatter.get("description", "")).strip()
-        lines.append(f"- {path.parent.name}: {description[:160]}")
-    return "\n".join(lines)
+    except OSError:
+        return ""
+    description = str(frontmatter.get("description", "")).strip()
+    return f"- {path.parent.name}: {description[:160]}{suffix}"
+
+
+#: Ceiling on either half of the skill listing in a prompt. A backlog is
+#: exactly when this matters -- an unreviewed queue is unbounded, and a prompt
+#: that grows a line per proposal quietly raises the price of every review.
+MAX_LISTED_SKILLS = 40
+
+
+def _listing(lines: List[str]) -> str:
+    if len(lines) <= MAX_LISTED_SKILLS:
+        return "\n".join(lines)
+    hidden = len(lines) - MAX_LISTED_SKILLS
+    return "\n".join(lines[:MAX_LISTED_SKILLS]) + (
+        f"\n- ...and {hidden} more not shown. The list is truncated, so a name "
+        "missing from it is not proof the skill does not exist."
+    )
+
+
+def describe_writable() -> str:
+    """The library the fork is working against: what is live, and what is queued.
+
+    The queued half is not decoration. A proposal waiting for review is already
+    in the fork's work tree, and a fork that cannot see it listed will read the
+    live library, find nothing that covers this session's lesson, and create a
+    sibling of the skill it should have extended. That is how one library ends
+    up with six overlapping git skills, none of them approved.
+    """
+    live = [text for text in (_describe(p) for p in guard.writable_skills()) if text]
+    queued = []
+    for skill, entry in sorted(pending.proposals().items()):
+        path = guard.PENDING_DIR / entry["id"] / "after" / skill / "SKILL.md"
+        session = str(entry.get("session") or "")[:8]
+        text = _describe(path, suffix=f"  [queued, from session {session}]")
+        if text:
+            queued.append(text)
+
+    blocks = []
+    if live:
+        blocks.append("In the library, approved:\n" + _listing(live))
+    if queued:
+        blocks.append(
+            "Proposed by an earlier session and waiting for the author's "
+            "review. These are already in your working copy and are yours to "
+            "extend — a lesson that belongs in one of them belongs THERE, not "
+            "in a new skill beside it:\n" + _listing(queued)
+        )
+    if not blocks:
+        return (
+            "(none yet — the library is empty and nothing is queued. Create the "
+            "first class-level skill if this session earned one.)"
+        )
+    return "\n\n".join(blocks)
 
 
 #: What the reflect pass must return. Structured output is not a formatting
@@ -333,10 +387,17 @@ def normalize_new_skills(session_id: str) -> None:
       approved, be permanently unpatchable by the loop -- it would look
       hand-written forever. If the loop created it, it owns it.
     """
+    queued = pending.proposals()
     for path in guard.WORK_DIR.rglob("SKILL.md"):
         skill = path.parent.name
         if (guard.SKILLS_DIR / skill / "SKILL.md").exists():
             continue  # a patch, not a creation -- leave its frontmatter alone
+        if skill in queued:
+            # Seeded from the queue, so it was created by an earlier session and
+            # already carries that session's id. Restamping it would both
+            # misattribute the skill and, because the bytes changed, re-file an
+            # untouched proposal under whichever session ran last.
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
@@ -409,6 +470,32 @@ def _log_budget(session_id: str, returncode: int, outcome: "guard.ForkResult") -
             "session": session_id,
             "limit_usd": guard.MAX_BUDGET_USD,
         })
+
+
+def _record_failure(
+    session_id: str,
+    transcript: Path,
+    outcome: "guard.ForkResult",
+    reason: str,
+) -> None:
+    """Decide what a failed fork costs the transcript's retry budget.
+
+    Three failures that look identical in the exit code and are not:
+
+    - **Rate limited.** The account is out of usage for now. Nothing about this
+      transcript caused it and nothing about it will be different next time, so
+      it must not spend an attempt -- the first real failure in the wild was
+      exactly this, and counting it as an error is how a reviewable session gets
+      thrown away. The watermark stays put and the sweep comes back to it.
+    - **Budget ceiling.** This transcript costs more to review than the ceiling
+      allows. Deterministic, so retrying spends the ceiling twice more for the
+      same outcome. Given up on immediately, loudly, with the ceiling named.
+    - **Anything else.** An ordinary attempt, retried up to ``MAX_ATTEMPTS``.
+    """
+    if outcome.hit_rate_limit:
+        log({"event": "rate-limited", "session": session_id, "reason": reason})
+        return
+    mark_failed(session_id, transcript, reason, terminal=outcome.hit_budget)
 
 
 def _total_cost(*outcomes) -> Optional[float]:
@@ -503,6 +590,15 @@ def review(
         except FileNotFoundError:
             log({"event": "error", "reason": "claude binary not found"})
             return 0
+        except ValueError as exc:
+            # subprocess refuses an argv element it cannot pass to exec. The one
+            # that happens in practice is a NUL byte in the digest; digest.clean
+            # strips those now, so reaching this means a new shape of unpassable
+            # prompt. Retrying it would fail identically.
+            log({"event": "error", "reason": repr(exc), "session": session_id,
+                 "pass": "reflect"})
+            mark_failed(session_id, transcript, "unpassable prompt", terminal=True)
+            return 0
 
         reflected = guard.parse_fork_result(first.stdout)
         _log_budget(session_id, first.returncode, reflected)
@@ -510,7 +606,9 @@ def review(
             log({"event": "reflect-failed", "session": session_id,
                  "exit": first.returncode, "cost_usd": reflected.cost_usd,
                  "stderr": (first.stderr or "")[:1000]})
-            mark_failed(session_id, transcript, f"reflect exit {first.returncode}")
+            _record_failure(
+                session_id, transcript, reflected, f"reflect exit {first.returncode}"
+            )
             return 0
 
         lessons, note = extract_lessons(reflected)
@@ -560,6 +658,11 @@ def review(
         except FileNotFoundError:
             log({"event": "error", "reason": "claude binary not found"})
             return 0
+        except ValueError as exc:
+            log({"event": "error", "reason": repr(exc), "session": session_id,
+                 "pass": "place"})
+            mark_failed(session_id, transcript, "unpassable prompt", terminal=True)
+            return 0
 
         result = second
         outcome = guard.parse_fork_result(second.stdout)
@@ -600,7 +703,9 @@ def review(
         if result.returncode == 0:
             mark_reviewed(session_id, transcript)
         else:
-            mark_failed(session_id, transcript, f"exit {result.returncode}")
+            _record_failure(
+                session_id, transcript, outcome, f"place exit {result.returncode}"
+            )
         return 0
 
 
@@ -644,7 +749,22 @@ def show_status() -> int:
     if budget_stops:
         print(
             f"\n{len(budget_stops)} run(s) stopped at the spend ceiling. "
-            "Raise PATINA_MAX_USD or accept the truncation -- retrying will not help."
+            "Raise PATINA_MAX_USD to review those sessions -- they are not "
+            "retried,\nbecause the next attempt would stop at the same number."
+        )
+    limited = [e for e in entries if e.get("event") == "rate-limited"]
+    if limited:
+        print(
+            f"\n{len(limited)} run(s) hit an account usage limit. Those "
+            "transcripts kept their place in\nthe queue and will be retried by "
+            "the sweep; no attempt was spent."
+        )
+    refused = [e for e in entries if e.get("event") == "dropped-refused"]
+    if refused:
+        names = sorted({name for e in refused for name in (e.get("paths") or [])})
+        print(
+            f"\n{len(refused)} proposal(s) dropped for a name you had already "
+            "rejected: " + ", ".join(names[:5])
         )
     thin = [e for e in entries if e.get("reason") == "thin session"]
     nothing = sum(1 for e in reviews if "nothing to save" in (e.get("reply") or "").lower())

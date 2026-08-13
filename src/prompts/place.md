@@ -27,9 +27,17 @@ shapes HOW you place a lesson, not WHETHER you act on one.
 1. **Update a skill that was loaded this session.** A lesson's
    `suggested_target` usually names one. A skill that was in play is the right
    one to extend — provided it is writable.
-2. **Update an existing umbrella skill.** If no loaded skill fits but an
-   existing class-level one does, patch it: add a subsection, a pitfall, or
-   broaden a trigger.
+2. **Update an existing umbrella skill, live or queued.** If no loaded skill
+   fits but an existing class-level one does, patch it: add a subsection, a
+   pitfall, or broaden a trigger.
+
+   The list below marks some skills as queued. Those are proposals an earlier
+   session wrote that the author has not reviewed yet, and they are already in
+   your working copy — extending one is a normal edit, not a special case. Treat
+   them exactly as you would an approved skill: if a lesson belongs in one, it
+   belongs THERE. A new skill filed beside a queued one that covers the same
+   class is the single most common way this library goes wrong, because the
+   author then has two half-answers to review instead of one whole one.
 3. **Add a support file under an existing umbrella.** Three kinds, each with its
    own directory:
    - `references/<topic>.md` — session-specific detail (error transcripts,
@@ -77,7 +85,7 @@ You may ONLY create or modify skills under `{skills_dir}` that carry
 `metadata.autoManaged: true` in their frontmatter. Any new skill you create MUST
 include that marker, or it will be reverted.
 
-Currently writable skills:
+The skills you may write to, live and queued:
 
 {writable_skills}
 
@@ -105,9 +113,44 @@ metadata:
 ---
 ```
 
-Front-load the trigger phrase in the description — it is what a future session
-matches against. Write it in the third person, and keep SKILL.md itself short
-enough to be worth loading: detail belongs in `references/`.
+---
+
+## How to write the thing itself
+
+These are Anthropic's own skill-authoring rules, from the skill-creator skill.
+They are not style preferences: each one is a way a skill fails in use.
+
+**The description is the whole triggering mechanism.** A future session sees
+only the name and the description — the body is loaded *after* the decision to
+load it has been made. So every "when to use this" cue goes in the description,
+front-loaded, in the third person. Claude's failure mode here is
+*under*-triggering rather than over-triggering, so name the contexts explicitly
+and be a little pushy about them. "Reviewing database migrations" triggers on
+almost nothing. "Use when reviewing, writing, or approving a database migration,
+or when a schema change is about to be deployed" triggers on what it should.
+
+**Load in three levels.** Name and description are in context always; the
+SKILL.md body only when it triggers; `references/` only when the body points at
+it. Write to that shape. A body over ~500 lines is not an overview any more —
+move the detail into `references/` and leave a pointer saying when to go read
+it. A reference file over ~300 lines needs a table of contents, because it will
+often be read partially from the top.
+
+**Explain why, don't shout.** ALWAYS and NEVER in capitals, and rigid
+scaffolding generally, are a yellow flag: they tell a capable model what to do
+while withholding what it needs to generalise from. A session that knows *why*
+a rule exists applies it correctly in a case you did not anticipate; one that
+only knows the rule follows it off a cliff. Where you would write a MUST, write
+the reason instead. Use the imperative for the instruction itself.
+
+**Generalise past this session.** The lesson came from one incident, but the
+skill will load for a class of work. Write the rule, not the anecdote — keeping
+the incident only as the concrete example that makes the rule believable.
+Narrow, overfitted skills survive review and then never match anything again.
+
+**Organise by variant when a skill spans several.** `references/aws.md`,
+`references/gcp.md` beside a SKILL.md that selects between them beats one body
+that covers all three, because the session reads only the one that applies.
 
 ---
 

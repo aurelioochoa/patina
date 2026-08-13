@@ -381,7 +381,15 @@ def run(sweep_only: bool = False, curate_only: bool = False) -> int:
     """
     with guard.lock("curator", timeout=1.0) as acquired:
         if not acquired:
-            review_mod.log({"event": "curate-deferred", "reason": "lock held"})
+            # Named for what was actually deferred. Every daily sweep that lost
+            # this race logged "curate-deferred", which reads as the weekly pass
+            # being blocked -- a much more alarming thing than two sessions
+            # starting at once, and one that sent a reader looking for a bug in
+            # the interval logic instead.
+            review_mod.log({
+                "event": "sweep-deferred" if sweep_only else "curate-deferred",
+                "reason": "lock held",
+            })
             return 0
         state = read_state()
         if not curate_only:

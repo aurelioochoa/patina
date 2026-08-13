@@ -20,8 +20,10 @@ project runs tests with `pnpm`, not `npm`. You work out a fiddly fix for a build
 11pm. Next session, all of it is gone.
 
 patina is a background loop that reads your finished sessions and turns what it learned into
-skills — the files Claude actually loads next time. It runs after you've closed the terminal,
-costs a few cents a session, and never changes anything without asking you first.
+skills — the files Claude actually loads next time. It runs after you've closed the terminal
+and never changes anything without asking you first. A session that taught something costs
+around 40 cents to review at Sonnet prices; one that taught nothing stops after a cheap
+first pass. `/patina:status` tells you what you've actually spent.
 
 It's a port of [Hermes Agent](https://github.com/hermes-agent)'s self-improvement loop to
 Claude Code, and it's named for the finish that builds on a surface through use — the kind
@@ -87,7 +89,7 @@ That's it. The loop starts working at the end of your next session.
 |---|---|
 | `/patina:status` | Is the loop running? What is it costing? Is any of it being used? |
 | `/patina:pending` | What it wants to change |
-| `/patina:approve <id>` | Apply one — or `--all` if you're feeling brave |
+| `/patina:approve <id>` | Apply one — or `--all` if you're feeling brave, or `<id> --refine` to work on the draft first |
 | `/patina:reject <id>` | Discard one |
 | `/patina:patination` | Review the session you're in right now, without waiting for it to end |
 | `/patina:curate` | Tidy the library now, instead of waiting for the weekly pass |
@@ -136,6 +138,7 @@ reject.
 ```sh
 pending.py list                 # what the loop wants to change
 pending.py show <id>            # the claims, then the checks, then the diff
+pending.py refine <id>          # work on the draft before it lands
 pending.py approve <id>         # apply it, and trust that skill from now on
 pending.py reject <id>          # discard it
 pending.py approve --all
@@ -150,9 +153,30 @@ skill you already have. Anything that would stop the skill loading at all blocks
 Patches go through the queue too, not just new skills. Patching is the loop's most common
 action, and one that skipped review could quietly change a skill you already trust.
 
-A note on rejection: it removes the entry, and for a *new* skill it also records a refusal
-that the use-time gate honours. It does **not** stop a later session proposing the same
-thing again — nothing in the capture path consults that record.
+A note on rejection: it removes the entry, and for a *new* skill it records a refusal that
+both the use-time gate and the capture path honour. A later session that writes a skill by
+that name has it dropped before it reaches the queue, and the drop is logged. Rejecting
+something twice should not be a thing this asks of you.
+
+### The queue is part of the library, as far as the loop is concerned
+
+The writing pass works against your library *with the queue laid on top* — what it would
+look like if you approved everything pending. That matters more than it sounds. A proposal
+you haven't got to yet is invisible in the live library, so a fork that only saw the live
+library would find nothing covering today's lesson and file another new skill; a week of
+that is six overlapping git skills, none approved. Seeing the queue, it extends the
+proposal instead, and the entry grows to carry both sessions' evidence rather than
+splitting into rival half-answers.
+
+### Refining a draft before it lands
+
+What the loop files is a draft. The pass that wrote it had no user to ask, no way to test
+whether the skill actually fires, and a spend ceiling — so the trigger phrase and the
+wording are exactly what it couldn't settle. `pending.py refine <id>` stages an editable
+copy and points you at [skill-creator](https://github.com/anthropics/skills) if you have it
+installed, which is where evals and description-triggering optimisation live. Finish with
+`approve <id> --from <path>`; the refined copy is re-checked before it is applied, and the
+queue entry is untouched until then, so an abandoned refinement costs nothing.
 
 **Why quarantine at all, rather than just prompting when a skill is used?** Because a skill's
 name and description go into the system prompt every single session, whether or not it's ever
@@ -356,7 +380,9 @@ entender. En la siguiente sesión, nada de eso existe.
 
 patina es un proceso en segundo plano que lee tus sesiones terminadas y convierte lo aprendido
 en *skills*: los archivos que Claude sí carga la próxima vez. Corre después de que cerraste la
-terminal, cuesta unos centavos por sesión, y **nunca cambia nada sin preguntarte antes**.
+terminal y **nunca cambia nada sin preguntarte antes**. Revisar una sesión que sí enseñó algo
+cuesta alrededor de 40 centavos con Sonnet; una que no enseñó nada se detiene en la primera
+pasada, que es barata. `/patina:status` te dice cuánto llevas gastado.
 
 ### Cómo funciona
 
@@ -394,6 +420,31 @@ de un skill entran al prompt del sistema en cada sesión, se invoque o no. Un ma
 en tu biblioteca consume contexto y sesga el comportamiento sin que la herramienta `Skill` se
 active nunca. Controlar la invocación no arregla eso; mantenerlo fuera de la biblioteca sí.
 
+Rechazar una propuesta nueva también registra la negativa, y desde entonces la captura la
+respeta: si una sesión posterior vuelve a escribir un skill con ese nombre, se descarta antes
+de llegar a la cola. Rechazar dos veces lo mismo no debería ser tu trabajo.
+
+### La cola es parte de la biblioteca, para el proceso
+
+El paso que escribe trabaja sobre tu biblioteca **con la cola encima**: cómo se vería si
+aprobaras todo lo pendiente. Importa más de lo que parece. Una propuesta que todavía no
+revisaste es invisible en la biblioteca real, así que un proceso que solo viera esa
+biblioteca no encontraría nada que cubra la lección de hoy y crearía otro skill nuevo — una
+semana así son seis skills de git superpuestos, ninguno aprobado. Viendo la cola, extiende la
+propuesta que ya existe, y esa entrada acumula la evidencia de las dos sesiones en vez de
+partirse en dos respuestas a medias.
+
+### Pulir un borrador antes de aplicarlo
+
+Lo que la cola guarda es un borrador. El proceso que lo escribió no tenía a quién preguntar,
+ni forma de probar si el skill realmente se dispara, ni presupuesto de sobra: justo lo que no
+pudo resolver es la frase disparadora y la redacción. `pending.py refine <id>` prepara una
+copia editable y te apunta a [skill-creator](https://github.com/anthropics/skills) si lo
+tienes instalado, que es donde viven las *evals* y la optimización del disparador. Terminas
+con `approve <id> --from <ruta>`; la copia pulida se vuelve a verificar antes de aplicarse, y
+la entrada de la cola queda intacta hasta ese momento, así que abandonar el pulido no cuesta
+nada.
+
 ### Instalación
 
 ```sh
@@ -416,7 +467,7 @@ Listo. El proceso empieza a trabajar al final de tu siguiente sesión.
 |---|---|
 | `/patina:status` | ¿Está corriendo? ¿Cuánto cuesta? ¿Se usa algo de lo que escribió? |
 | `/patina:pending` | Qué quiere cambiar |
-| `/patina:approve <id>` | Aplicar uno, o `--all` para todos |
+| `/patina:approve <id>` | Aplicar uno, `--all` para todos, o `<id> --refine` para pulir el borrador antes |
 | `/patina:reject <id>` | Descartar uno |
 | `/patina:patination` | Revisar la sesión en curso, sin esperar a que termine |
 | `/patina:curate` | Ordenar la biblioteca ahora, sin esperar a la pasada semanal |

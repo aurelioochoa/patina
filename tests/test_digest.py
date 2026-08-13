@@ -187,6 +187,30 @@ def test_empty_transcript_still_renders_header(tmp_path):
     assert "[Session context]" in result.text
 
 
+
+def test_control_bytes_are_stripped_from_the_digest(tmp_path):
+    """A NUL anywhere in a transcript used to cost the whole review.
+
+    The digest is handed to the fork as an argv element, and subprocess refuses
+    one containing a NUL with ValueError('embedded null byte') -- which the hook
+    caught and logged as an unexplained error, losing the session.
+    """
+    path = write_transcript(tmp_path, [
+        user("here is a hexdump: \x00\x01\x02 and a bell \x07"),
+        assistant("noted\x00"),
+    ])
+    result = digest.build(path)
+    assert "\x00" not in result.text
+    assert not any(ch in result.text for ch in "\x01\x07")
+    assert "hexdump" in result.text and "noted" in result.text
+
+
+def test_a_control_byte_in_the_session_metadata_is_stripped_too(tmp_path):
+    """cwd and branch come from the transcript and never pass through clean()."""
+    path = write_transcript(tmp_path, [user("hi", cwd="/home/u/pro\x00ject")])
+    assert "\x00" not in digest.build(path).text
+
+
 if __name__ == "__main__":
     import subprocess
 

@@ -230,6 +230,31 @@ class ForkResult:
         haystack = f"{self.subtype} {self.text}".lower()
         return "budget" in haystack and "exceed" in haystack or "max_budget" in haystack
 
+    @property
+    def hit_rate_limit(self) -> bool:
+        """Did this fork fail because the account is out of usage right now?
+
+        A different thing from every other failure: it says nothing about the
+        transcript. Counting it as an ordinary error spends the retry budget on
+        a condition that clears by itself, and the session it was reviewing --
+        which may be the one with the lesson in it -- is dropped for a reason
+        that had nothing to do with it.
+        """
+        haystack = f"{self.subtype} {self.text}".lower()
+        return any(
+            phrase in haystack
+            for phrase in (
+                "session limit",
+                "usage limit",
+                "rate limit",
+                "rate_limit",
+                "429",
+                "try again later",
+                "resets at",
+                "upgrade to increase your usage limit",
+            )
+        )
+
 
 def parse_fork_result(stdout: str) -> ForkResult:
     raw = (stdout or "").strip()

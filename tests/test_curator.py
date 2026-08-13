@@ -34,6 +34,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(review_mod, "AUDIT_LOG", tmp_path / "state" / "audit.jsonl")
     monkeypatch.setattr(review_mod, "STATE_FILE", tmp_path / "state" / "state.json")
     monkeypatch.setattr(guard, "PENDING_DIR", tmp_path / "state" / "pending")
+    monkeypatch.setattr(guard, "WORK_ROOT", tmp_path / "work")
     monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "work" / "skills")
     monkeypatch.setattr(guard, "APPROVALS_FILE", tmp_path / "state" / "approvals.json")
 

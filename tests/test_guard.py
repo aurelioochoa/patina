@@ -418,3 +418,22 @@ def test_parse_fork_result_does_not_echo_an_error_envelope_as_the_reply():
     assert outcome.text == ""
     assert outcome.hit_budget
     assert outcome.cost_usd == 0.22
+
+
+def test_a_usage_limit_is_recognised_as_its_own_kind_of_failure():
+    """It says nothing about the transcript, so it must not spend a retry."""
+    limited = guard.ForkResult(text="You've hit your session limit. Resets at 3pm.")
+    assert limited.hit_rate_limit
+    assert not limited.hit_budget
+
+
+def test_an_ordinary_failure_is_not_read_as_a_usage_limit():
+    """False positives here are worse than misses: a transcript that genuinely
+    breaks the fork would be retried until it aged out."""
+    for text in ("Error: file not found", "the model returned nothing", ""):
+        assert not guard.ForkResult(text=text).hit_rate_limit
+
+
+def test_the_spend_ceiling_is_not_read_as_a_usage_limit():
+    stopped = guard.ForkResult(text="stopped", subtype="error_max_budget_exceeded")
+    assert stopped.hit_budget and not stopped.hit_rate_limit

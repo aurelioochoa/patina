@@ -189,6 +189,21 @@ def test_skills_only_pre_approve_patina_commands(path):
             assert verb in COMMANDS, f"{path.parent.name} pre-approves {verb!r}"
 
 
+def test_the_approve_skill_only_names_subcommands_the_queue_has():
+    """The skill walks the user through refinement. A verb renamed in
+    pending.py but not here fails inside the command that is meant to fix a
+    proposal, with a staged copy already sitting on disk."""
+    text = (ROOT / "skills" / "approve" / "SKILL.md").read_text(encoding="utf-8")
+    usage = subprocess.run(
+        [str(ROOT / "bin" / "patina"), "pending", "--help"],
+        capture_output=True, text=True,
+    ).stdout
+    verbs = usage.split("{", 1)[1].split("}", 1)[0].split(",")
+    for verb in ("refine", "approve"):
+        assert verb in verbs
+        assert f"patina pending {verb}" in text
+
+
 def test_the_read_only_skills_cannot_write(path=None):
     """status and pending are for looking. Neither may pre-approve a mutation."""
     for name in ("status", "pending"):

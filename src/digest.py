@@ -90,12 +90,22 @@ _STRIP_BLOCKS = re.compile(
 _COMMAND_NAME = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL)
 _EMPTY_TAGS = re.compile(r"</?(local-command-caveat|local-command-stdout)>")
 
+#: Control characters that survive JSON decoding and whitespace splitting.
+#: A NUL among them is fatal rather than ugly: the digest is handed to the fork
+#: as an argv element, and ``subprocess`` refuses an argument containing one
+#: with ``ValueError: embedded null byte``. A single such byte anywhere in a
+#: transcript -- a hexdump, a binary file read, a terminal capture -- therefore
+#: cost the whole review. Stripped at the one place every message passes
+#: through.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
 
 def clean(text: str) -> str:
     """Remove harness plumbing, keeping invoked command names."""
     text = _STRIP_BLOCKS.sub("", text)
     text = _COMMAND_NAME.sub(lambda m: f"[ran {m.group(1)}]", text)
     text = _EMPTY_TAGS.sub("", text)
+    text = _CONTROL_CHARS.sub("", text)
     return " ".join(text.split())
 
 
@@ -316,7 +326,9 @@ def render(
                 + "\n\n".join(_render(m) for m in recent)
             )
 
-        text = "\n\n".join(sections)
+        # Header fields (cwd, branch, skill names) come from the transcript too
+        # and never pass through clean(). One sweep here covers them.
+        text = _CONTROL_CHARS.sub("", "\n\n".join(sections))
         if len(text) <= max_chars or current_tail == 0:
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n[digest truncated at ceiling]"

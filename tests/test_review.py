@@ -151,6 +151,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(review, "AUDIT_LOG", tmp_path / "state" / "audit.jsonl")
     monkeypatch.setattr(review, "STATE_FILE", tmp_path / "state" / "state.json")
     monkeypatch.setattr(guard, "PENDING_DIR", tmp_path / "state" / "pending")
+    monkeypatch.setattr(guard, "WORK_ROOT", tmp_path / "work")
     monkeypatch.setattr(guard, "WORK_DIR", tmp_path / "work" / "skills")
     monkeypatch.setattr(guard, "APPROVALS_FILE", tmp_path / "state" / "approvals.json")
 
@@ -903,3 +904,247 @@ def test_missing_structured_output_is_reported_not_silently_a_no_op(env):
 
     entry = [e for e in audit(env) if e["event"] == "reflect-unstructured"][0]
     assert entry["recovered"] is False
+
+
+# --- the queue is part of the library the fork works against ---------------
+#
+# Without this the loop's most expensive failure is invisible: every fork reads
+# an unchanged library, concludes nothing covers today's lesson, and files
+# another new skill. Six overlapping git skills, none approved, is what that
+# looks like after a week.
+
+
+def queue_a_skill(env, name: str, body: str, session: str) -> None:
+    """Run one review whose fork writes `body` to `name`, leaving it queued."""
+    make_stub(env.bin, stub_writes(
+        guard.WORK_DIR / name / "SKILL.md", body, "created"
+    ))
+    review.review(env.transcript, session, env.cwd)
+
+
+def test_a_queued_proposal_is_seeded_into_the_next_work_tree(env):
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    pending.prepare_work_tree()
+
+    assert (guard.WORK_DIR / "learned" / "SKILL.md").is_file()
+
+
+def test_the_place_prompt_says_which_skills_are_queued(env):
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    prompt = review.build_place_prompt(ONE_LESSON, "sess-second")
+
+    assert "- learned:" in prompt
+    assert "queued, from session sess-fir" in prompt
+    assert "waiting for the author's review" in prompt
+
+
+def test_a_second_session_extends_the_proposal_rather_than_filing_a_sibling(env):
+    """The whole point. Two sessions, one growing proposal, both sets of claims."""
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    second = [{
+        "kind": "pitfall",
+        "claim": "A second thing worth knowing.",
+        "evidence": "\"careful with that\"",
+        "confidence": "medium",
+        "suggested_target": "learned",
+    }]
+    make_stub(
+        env.bin,
+        stub_writes(
+            guard.WORK_DIR / "learned" / "SKILL.md",
+            MARKED.format(name="learned") + "\nAnd another section.",
+            "extended",
+        ),
+        lessons=second,
+    )
+    review.review(env.transcript, "sess-second", env.cwd)
+
+    queue = pending.entries()
+    assert [e["skill"] for e in queue] == ["learned"], "one skill, one entry"
+    entry = queue[0]
+    assert entry["id"] == "learned-sess-sec"
+    assert entry["supersedes"] == ["learned-sess-fir"]
+    assert entry["sessions"] == ["sess-first", "sess-second"]
+    claims = [c["claim"] for c in entry["claims"]]
+    assert claims == [ONE_LESSON[0]["claim"], second[0]["claim"]]
+    assert "And another section." in (
+        guard.PENDING_DIR / entry["id"] / "after" / "learned" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_a_proposal_the_fork_left_alone_keeps_its_entry(env):
+    """The seeded tree differs from the live library in every byte. Diffing
+    against the library alone would re-file every proposal under whichever
+    session ran last, and the claims would drift away from the file."""
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    queue_a_skill(env, "other", MARKED.format(name="other"), "sess-second")
+
+    ids = sorted(e["id"] for e in pending.entries())
+    assert ids == ["learned-sess-fir", "other-sess-sec"]
+
+
+def test_a_name_the_author_rejected_is_not_proposed_again(env):
+    """Rejection has to buy freedom from being asked again. It did not: the
+    same skill came back from three separate sessions after a `never`."""
+    import pending
+
+    pending.set_approval("learned", "never")
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-again")
+
+    assert pending.entries() == []
+    dropped = [e for e in audit(env) if e["event"] == "dropped-refused"]
+    assert dropped and dropped[0]["paths"] == ["learned"]
+
+
+def test_a_rejected_name_still_blocks_after_the_skill_is_gone(env):
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    pending.reject("learned-sess-fir")
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-second")
+
+    assert pending.entries() == []
+
+
+# --- what a failed fork costs the transcript -------------------------------
+
+
+def test_a_rate_limited_fork_does_not_spend_an_attempt(env):
+    """Nothing about the transcript caused it and nothing about it will be
+    different next time. Counting it as an error is how the session with the
+    lesson in it gets thrown away three sweeps later."""
+    make_stub(env.bin, stub_json(
+        "You've hit your session limit. Resets at 3pm.", exit_code=1
+    ))
+    review.review(env.transcript, "sess-limited", env.cwd)
+
+    assert "sess-limited" not in watermarks()
+    assert "sess-limited" not in attempts()
+    assert any(e["event"] == "rate-limited" for e in audit(env))
+
+
+def test_the_spend_ceiling_is_terminal_rather_than_retried(env):
+    """This transcript costs more than the ceiling allows. Deterministic, so
+    two more attempts buy two more forks at the ceiling and the same result."""
+    make_stub(env.bin, stub_json(
+        "stopped", exit_code=1, subtype="error_max_budget_exceeded"
+    ))
+    review.review(env.transcript, "sess-costly", env.cwd)
+
+    assert "sess-costly" in watermarks()
+    assert "sess-costly" not in attempts()
+    gave_up = [e for e in audit(env) if e["event"] == "gave-up"]
+    assert gave_up and gave_up[0]["attempts"] == review.MAX_ATTEMPTS
+
+
+# --- refinement: the one point in the loop where a human is present --------
+
+
+def test_refine_stages_a_copy_and_leaves_the_entry_alone(env):
+    """Refinement can be abandoned. An entry rewritten in place would be
+    neither the proposal the loop made nor the skill the author wanted."""
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    entry = pending.entries()[0]
+    staged = pending.stage_for_refinement(entry)
+
+    assert (staged / "SKILL.md").is_file()
+    assert pending.get(entry["id"]) is not None
+    assert (guard.PENDING_DIR / entry["id"] / "after" / "learned" / "SKILL.md").is_file()
+
+
+def test_approve_from_applies_the_refined_copy(env):
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    entry = pending.entries()[0]
+    staged = pending.stage_for_refinement(entry)
+    (staged / "SKILL.md").write_text(
+        MARKED.format(name="learned") + "\nRefined by hand.", encoding="utf-8"
+    )
+
+    assert pending.approve(entry["id"], source=staged)
+    live = (env.skills / "learned" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Refined by hand." in live
+    assert pending.entries() == []
+
+
+def test_a_refined_copy_is_checked_again_before_it_is_applied(env):
+    """The entry's recorded checks describe the draft. Approving a refined
+    directory on the strength of them would apply a file nothing has read."""
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    entry = pending.entries()[0]
+    staged = pending.stage_for_refinement(entry)
+    (staged / "SKILL.md").write_text(
+        "---\nname: Learned Skill\ndescription: x\n---\n\nBody.\n", encoding="utf-8"
+    )
+
+    assert not pending.approve(entry["id"], source=staged)
+    assert not (env.skills / "learned").exists()
+
+
+def test_refine_reports_a_missing_skill_creator_rather_than_failing(env, capsys):
+    import pending
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    assert pending.cmd_refine("learned-sess-fir") == 0
+    out = capsys.readouterr().out
+    assert "staged:" in out
+    assert "patina pending approve learned-sess-fir --from" in out
+
+
+def test_skill_creator_is_found_in_a_plugin_layout(env, monkeypatch):
+    import pending
+
+    root = env.tmp / "claude"
+    installed = (root / "plugins" / "cache" / "official" / "skill-creator"
+                 / "skills" / "skill-creator")
+    installed.mkdir(parents=True)
+    (installed / "SKILL.md").write_text("---\nname: skill-creator\n---\n")
+    monkeypatch.setattr(guard, "CLAUDE_DIR", root)
+
+    assert pending.skill_creator_path() == installed
+
+
+def test_a_long_queue_does_not_grow_the_prompt_without_bound(env, monkeypatch):
+    """A backlog is exactly when this matters: the queue is unbounded, and a
+    prompt that grows a line per proposal raises the price of every review."""
+    monkeypatch.setattr(review, "MAX_LISTED_SKILLS", 3)
+    for index in range(5):
+        queue_a_skill(
+            env, f"learned-{index}", MARKED.format(name=f"learned-{index}"),
+            f"sess-{index}",
+        )
+    prompt = review.build_place_prompt(ONE_LESSON, "sess-late")
+
+    assert "...and 2 more not shown" in prompt
+    assert prompt.count("[queued, from session") == 3
+
+
+def test_refine_says_when_skill_creator_is_only_a_marketplace_clone(env, monkeypatch, capsys):
+    """`marketplace add` leaves a readable copy with no Skill tool entry. Told
+    only where it is, a session hunts for a command that does not exist."""
+    import pending
+
+    root = env.tmp / "claude"
+    clone = (root / "plugins" / "marketplaces" / "official" / "plugins"
+             / "skill-creator" / "skills" / "skill-creator")
+    clone.mkdir(parents=True)
+    (clone / "SKILL.md").write_text("---\nname: skill-creator\n---\n")
+    monkeypatch.setattr(guard, "CLAUDE_DIR", root)
+
+    queue_a_skill(env, "learned", MARKED.format(name="learned"), "sess-first")
+    pending.cmd_refine("learned-sess-fir")
+
+    out = capsys.readouterr().out
+    assert "marketplace clone" in out
+    assert "claude plugin install skill-creator" in out
