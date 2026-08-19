@@ -32,18 +32,17 @@ front of the user in your own words:
   auto-approved skill actually runs.
 - What it costs: skill descriptions enter the system prompt of every later
   session whether or not the skill is invoked.
+- **What it covers**: the whole queue, including whatever is already waiting in
+  it, applied on every scheduled background pass — not only proposals filed
+  from here on. If they have a backlog, say how large it is, because turning
+  this on is what decides it.
 
-Offer `--dry-run` first if they have a queue and have not seen it. Then run
-`patina pending auto on`.
-
-Turning it on does **not** touch the existing queue. Applying the policy to a
-backlog is a separate, explicit `patina pending auto` — say so, and do not run
-it in the same breath as `on` unless they ask for both.
+If they have a queue they have not seen, run `--dry-run` first and report it
+before running `on`. Then run `patina pending auto on`.
 
 **`off`** — run `patina pending auto off`. Anything already approved stays where
 it is; trials already running still expire. Say both.
 
-**Applying the policy to the backlog** (`patina pending auto`, no flag) — show
-the dry run first and get an answer. Approving a queue unread is the failure the
-queue exists to prevent, and a policy the user has not seen behave is not yet a
-decision they have made.
+**Applying the policy right now** (`patina pending auto`, no flag) — this is
+only needed to avoid waiting for the next scheduled pass; autonomous mode does
+it on its own. Show the dry run first if the user has not seen one.

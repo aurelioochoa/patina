@@ -379,8 +379,14 @@ Each clause is a mechanism, not a reassurance:
   to use a skill no person has read, you see it — at the moment it is about to do work,
   rather than as one diff among 46.
 
-Turning it on leaves your existing queue alone. Applying the policy to a backlog is a
-separate, deliberate `/patina:auto` after you have read the dry run.
+**When it runs.** On every scheduled background pass — the daily sweep and the weekly curate,
+both already detached from your session — and at the end of any session that produced a
+proposal. Over the whole queue each time, not only what that pass happened to file. A queue
+only you can drain is the failure this exists to remove, so turning it on decides your
+backlog too. Read the dry run first if you have one.
+
+`/patina:auto --dry-run` is still there for when you want the answer now instead of at the
+next pass, and `patina pending auto` applies it immediately.
 
 Off by default. No version of this has ever written to a real library, and the first one to
 do so should be switched on by someone who decided to.
@@ -610,8 +616,11 @@ Cada cláusula es un mecanismo, no una promesa:
   que algo intente usar un skill que ninguna persona ha leído, lo ves — en el momento en que va
   a actuar, y no como un diff entre 46.
 
-Encenderlo no toca tu cola actual. Aplicar la política a lo acumulado es un `/patina:auto`
-aparte y deliberado, después de leer el `--dry-run`.
+**Cuándo corre.** En cada pasada programada en segundo plano — el barrido diario y la curación
+semanal, ambos ya separados de tu sesión — y al final de cualquier sesión que haya producido
+una propuesta. Sobre toda la cola cada vez, no solo sobre lo que esa pasada acaba de archivar.
+Una cola que solo tú puedes vaciar es justamente el fallo que esto viene a eliminar, así que
+encenderlo también decide lo que tienes acumulado. Lee el `--dry-run` primero si tienes cola.
 
 Apagado por defecto. Ninguna versión de esto ha escrito nunca en una biblioteca real, y la
 primera que lo haga debería encenderla alguien que lo decidió.

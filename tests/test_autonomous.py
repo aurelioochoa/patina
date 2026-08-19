@@ -256,6 +256,60 @@ def test_the_curator_archives_what_the_trial_did_not_justify(env):
     assert "ignored" not in pending.read_state()["auto_approved"]
 
 
+# --- it runs itself, in the background -------------------------------------
+
+
+def test_a_scheduled_pass_drains_a_backlog_it_did_not_file(env, monkeypatch):
+    """The point of autonomous mode. A queue only a person can drain is the
+    failure it exists to remove, so the scheduled background pass applies the
+    policy to everything waiting -- not only to what that run happened to
+    file, and without anyone typing the command."""
+    import curator
+    import review as review_mod
+
+    monkeypatch.setattr(review_mod, "AUDIT_LOG", env / "state" / "audit.jsonl")
+    monkeypatch.setattr(review_mod, "STATE_FILE", env / "state" / "state.json")
+    (env / "projects").mkdir()
+
+    queue_entry(env, skill="from-last-week")   # nothing in this run filed it
+    queue_entry(env, skill="also-waiting")
+    pending.cmd_auto("on")
+
+    curator.run(sweep_only=True)   # the daily background pass
+
+    assert (guard.SKILLS_DIR / "from-last-week").exists()
+    assert (guard.SKILLS_DIR / "also-waiting").exists()
+    assert pending.entries() == []
+
+
+def test_a_scheduled_pass_leaves_the_queue_alone_when_off(env, monkeypatch):
+    import curator
+    import review as review_mod
+
+    monkeypatch.setattr(review_mod, "AUDIT_LOG", env / "state" / "audit.jsonl")
+    monkeypatch.setattr(review_mod, "STATE_FILE", env / "state" / "state.json")
+    (env / "projects").mkdir()
+
+    queue_entry(env, skill="waiting")
+    curator.run(sweep_only=True)
+
+    assert not (guard.SKILLS_DIR / "waiting").exists()
+    assert [e["id"] for e in pending.entries()] == ["waiting-sess0"]
+
+
+def test_the_policy_holds_the_same_entry_every_pass_without_thrashing(env, monkeypatch):
+    """A held entry stays held and stays queued. Re-running the pass must be
+    idempotent -- it runs on every sweep, unattended, forever."""
+    queue_entry(env, skill="unsure", confidence="medium")
+    pending.cmd_auto("on")
+
+    first = pending.auto_approve_queue()
+    second = pending.auto_approve_queue()
+
+    assert first["held"] == second["held"]
+    assert [e["id"] for e in pending.entries()] == ["unsure-sess0"]
+
+
 # --- the gate is the last thing standing -----------------------------------
 
 

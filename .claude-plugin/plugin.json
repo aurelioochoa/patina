@@ -1,7 +1,7 @@
 {
   "name": "patina",
   "description": "Background self-improvement loop: reviews finished sessions and turns what it learned into skills — into a queue you approve, or, if you let it, straight into your library.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": {
     "name": "aurelioochoa"
   },

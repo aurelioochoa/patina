@@ -460,6 +460,21 @@ def run(sweep_only: bool = False, curate_only: bool = False) -> int:
             sweep(state)
         if not sweep_only:
             curate()
+        # Autonomous mode means the policy decides, not a person, so it has to
+        # run on its own schedule rather than waiting for someone to type the
+        # command. Every scheduled pass applies it to the whole queue -- not
+        # only what this run happened to file -- because a proposal held on one
+        # pass may be superseded by a better one later, and the queue is where
+        # anything the policy declined accumulates until it is looked at.
+        if pending.autonomous():
+            outcome = pending.auto_approve_queue()
+            if outcome["approved"] or outcome["held"]:
+                review_mod.log({
+                    "event": "auto-approval-pass",
+                    "session": "scheduled",
+                    "approved": outcome["approved"],
+                    "held": [f"{i}: {why}" for i, why in outcome["held"]],
+                })
         state = read_state()  # sweep advanced watermarks; re-read before stamping
         if not curate_only:
             state["last_sweep_run"] = now().isoformat()

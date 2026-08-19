@@ -146,11 +146,26 @@ Recorded in state rather than stamped into the skill's frontmatter — the file 
 model wrote and what the user may edit by hand, and a bookkeeping field the loop rewrites is
 one more thing that can go wrong in frontmatter that has to stay loadable.
 
-### Decided: the review and curate paths approve only what they just filed
+### Decided, then reversed same-day: the policy runs over the whole queue, unattended
 
-`auto_approve_queue(only=[...])`. Draining a standing backlog as a side effect of an unrelated
-session is not the same decision as turning autonomous mode on. Applying the policy to a
-backlog is `patina pending auto`, run by a person who read `--dry-run` first.
+First cut: `auto_approve_queue(only=[...])`, so the review and curate paths approved only what
+they had just filed. The reasoning was that draining a standing backlog as a side effect of an
+unrelated session is not the same decision as turning autonomous mode on.
+
+That was wrong, and the user said so plainly: *"with autonomous mode on you should decide on
+the backlog, that is the point of autonomous."* A queue that still requires a person to type
+a command is the failure this whole change exists to remove — it is the old queue with extra
+steps, and it would have left yesterday's proposals waiting while today's landed.
+
+So the automatic paths pass no `only=` at all, and `curator.run()` applies the policy on every
+scheduled pass — the daily sweep and the weekly curate, both already detached via
+`spawn_detached` from the `SessionStart` hook. That matters more than the session-end path: it
+means the queue drains in weeks where no session produces a proposal, without anything being
+typed. The parameter survives as a primitive and is covered by tests; nothing automatic uses
+it.
+
+The pass has to be idempotent, since it now runs unattended forever. It is: a held entry stays
+held with the same reason and stays queued, which is asserted directly.
 
 ### The promise that replaces the old one
 

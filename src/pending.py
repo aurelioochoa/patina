@@ -1213,9 +1213,12 @@ def cmd_auto(action: str) -> int:
                 f"  - Each is on trial for {auto_trial_days(state)} days: if "
                 "nothing loads it, the\n    curator archives it again.\n"
                 "  - The first time one actually runs, you are asked.\n\n"
-                "Your existing queue is untouched. To apply the policy to it:\n"
-                "  patina pending auto --dry-run    # see what it would take\n"
-                "  patina pending auto              # take it"
+                "This includes what is already queued. The policy runs over the "
+                "whole queue\non every scheduled pass, in the background -- "
+                "that is what makes it\nautonomous rather than a command you "
+                "have to remember.\n\n"
+                "  patina pending auto --dry-run    # what it would take, right now\n"
+                "  patina pending auto off          # stop it"
             )
         else:
             print(

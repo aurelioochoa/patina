@@ -787,13 +787,15 @@ def review(
         queued = pending.capture(session_id, summary=reply[:500], claims=lessons)
         sha = None
 
-        # Autonomous mode: apply the policy to what this review just filed, and
-        # nothing else. Draining the standing backlog is a separate decision a
-        # person makes with `patina pending auto`, not something an unrelated
-        # session does on their behalf.
+        # Autonomous mode: apply the policy to the whole queue, not only what
+        # this review just filed. Holding the backlog back was the cautious
+        # reading and it is the wrong one -- a queue that only a person can
+        # drain is the failure autonomous mode exists to remove, and leaving
+        # yesterday's proposals waiting while today's land is not a policy,
+        # it is the old queue with extra steps.
         auto = None
-        if queued and pending.autonomous():
-            auto = pending.auto_approve_queue(only=queued)
+        if pending.autonomous():
+            auto = pending.auto_approve_queue()
             log({
                 "event": "auto-approval-pass",
                 "session": session_id,
