@@ -178,6 +178,163 @@ def audit(env) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+# --- the prompt goes on stdin, not into argv --------------------------------
+
+
+def test_run_fork_sends_the_prompt_on_stdin(env, monkeypatch):
+    captured = {}
+    real_run = subprocess.run
+
+    def spy(command, **kwargs):
+        if command and command[0] == "claude":
+            captured["command"] = command
+            captured["input"] = kwargs.get("input")
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(review.subprocess, "run", spy)
+    guard.WORK_DIR.mkdir(parents=True, exist_ok=True)
+    review.run_fork("the prompt", tools=[])
+
+    assert captured["input"] == "the prompt"
+    assert "the prompt" not in captured["command"]
+
+
+def test_a_prompt_too_large_for_argv_still_forks(env):
+    """The bug this fixes, reproduced at its real threshold.
+
+    Linux caps a single argv string at MAX_ARG_STRLEN = 131072 bytes. Two real
+    sessions built reflect prompts of 136,606 and 133,233 bytes and died with
+    OSError(7) before the fork started -- then, because the catch-all left the
+    watermark alone, came back the next day and died again.
+    """
+    make_stub(env.bin, "printf 'ok'; exit 0")
+    guard.WORK_DIR.mkdir(parents=True, exist_ok=True)
+    huge = "x" * 200_000
+    assert len(huge.encode()) > 131_072
+    result = review.run_fork(huge, tools=[])  # must not raise OSError(7)
+    assert result.returncode == 0
+
+
+def test_each_pass_names_its_own_spend_ceiling(env, monkeypatch):
+    seen = []
+    real_run = subprocess.run
+
+    def spy(command, **kwargs):
+        if command and command[0] == "claude":
+            ceiling = command[command.index("--max-budget-usd") + 1]
+            seen.append((command[command.index("--model") + 1], ceiling))
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(review.subprocess, "run", spy)
+    guard.WORK_DIR.mkdir(parents=True, exist_ok=True)
+    review.run_fork("p", tools=[], max_budget_usd=guard.COMPACT_MAX_USD)
+    review.run_fork("p", max_budget_usd=guard.PLACE_MAX_USD)
+    assert seen[0][1] == guard.COMPACT_MAX_USD
+    assert seen[1][1] == guard.PLACE_MAX_USD
+
+
+# --- an unforeseen exception must terminate --------------------------------
+
+
+def test_an_exception_spends_an_attempt_and_eventually_gives_up(env, monkeypatch):
+    """A raise used to leave watermark and attempts untouched, so the sweep
+    retried the same transcript daily, forever."""
+    def boom(*args, **kwargs):
+        raise OSError(7, "Argument list too long")
+
+    monkeypatch.setattr(review, "review", boom)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["review.py", "--transcript", str(env.transcript), "--session-id", "sess-x"],
+    )
+
+    for _ in range(review.MAX_ATTEMPTS):
+        assert review.main() == 0  # the hook must never break a session
+
+    events = [e["event"] for e in audit(env)]
+    assert events.count("error") == review.MAX_ATTEMPTS
+    assert "gave-up" in events
+    state = json.loads((env.tmp / "state" / "state.json").read_text())
+    assert "sess-x" in state["watermarks"], "must stop being retried"
+    assert "sess-x" not in state.get("attempts", {})
+
+
+# --- a digest too big to review is condensed, not cut -----------------------
+
+
+def compacting_stub(bin_dir: Path, compaction: str, exit_code: int = 0) -> None:
+    """A claude that answers all three passes.
+
+    The compaction fork is the one running COMPACT_MODEL; reflect is the one
+    carrying the lessons schema. Matching on the model keeps the branches apart
+    without the compact pass needing a schema it has no use for.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    reflect = json.dumps({
+        "type": "result", "subtype": "success", "result": "reflected",
+        "structured_output": {"lessons": ONE_LESSON, "note": ""},
+        "total_cost_usd": 0.002,
+    }).replace("'", "'\''")
+    compact = json.dumps({
+        "type": "result", "subtype": "success", "result": compaction,
+        "total_cost_usd": 0.001,
+    }).replace("'", "'\''")
+    (bin_dir / "claude").write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        f"  *--model*{review.COMPACT_MODEL}*) printf '%s' '{compact}'; "
+        f"exit {exit_code};;\n"
+        f"  *--json-schema*lessons*) printf '%s' '{reflect}'; exit 0;;\n"
+        "esac\n"
+        "printf 'placed'\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "claude").chmod(0o755)
+
+
+def test_an_oversized_digest_is_compacted_before_review(env, monkeypatch):
+    monkeypatch.setattr(review.digest_mod, "DEFAULT_MAX_CHARS", 400)
+    env.transcript = make_transcript(env.tmp / "big.jsonl", env.cwd, turns=40)
+    compacting_stub(env.bin, "THE COMPACTION")
+
+    review.review(env.transcript, "sess-compact", env.cwd)
+
+    events = {e["event"]: e for e in audit(env)}
+    assert "compacted" in events, "a truncated digest must be compacted"
+    assert events["compacted"]["after_chars"] > 0
+    assert "compact-failed" not in events
+    # The review went through on the compacted digest.
+    assert events["review"]["exit"] == 0
+    # And the compaction is billed with the rest of it.
+    assert events["review"]["cost_usd"] > 0.002
+
+
+def test_a_failed_compaction_falls_back_to_truncation(env, monkeypatch):
+    """A compaction that did not work is a worse review. A compaction that
+    takes the review down with it is no review at all."""
+    monkeypatch.setattr(review.digest_mod, "DEFAULT_MAX_CHARS", 400)
+    env.transcript = make_transcript(env.tmp / "big.jsonl", env.cwd, turns=40)
+    compacting_stub(env.bin, "", exit_code=1)
+
+    review.review(env.transcript, "sess-nocompact", env.cwd)
+
+    events = {e["event"]: e for e in audit(env)}
+    assert "compact-failed" in events
+    assert "compacted" not in events
+    assert events["review"]["exit"] == 0, "the review still has to happen"
+
+
+def test_a_digest_that_fits_is_not_compacted(env):
+    compacting_stub(env.bin, "THE COMPACTION")
+    review.review(env.transcript, "sess-small", env.cwd)
+
+    events = [e["event"] for e in audit(env)]
+    assert "compacted" not in events, "no fork to spend when nothing was cut"
+    assert "review" in events
+
+
 # --- the guard has the last word -------------------------------------------
 
 

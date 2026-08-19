@@ -517,20 +517,24 @@ def build_diff(skill: str, files: List[str]) -> str:
     return "".join(chunks)
 
 
-def _log_rejected(
-    paths: List[str], session_id: str, event: str = "dropped-protected-edit"
-) -> None:
+def log(payload: Dict[str, Any]) -> None:
+    """Append one line to the shared audit log.
+
+    Never raises: a review that cannot write its own history is still a review,
+    and this runs inside a hook.
+    """
     guard.STATE_DIR.mkdir(parents=True, exist_ok=True)
     try:
         with open(guard.STATE_DIR / "audit.jsonl", "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({
-                "event": event,
-                "at": now(),
-                "session": session_id,
-                "paths": paths,
-            }) + "\n")
+            handle.write(json.dumps({**payload, "at": now()}) + "\n")
     except OSError:
         pass
+
+
+def _log_rejected(
+    paths: List[str], session_id: str, event: str = "dropped-protected-edit"
+) -> None:
+    log({"event": event, "session": session_id, "paths": paths})
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +596,10 @@ def blocking_findings(entry: Dict[str, Any]) -> List[str]:
 
 
 def approve(
-    entry_id: str, force: bool = False, source: Optional[Path] = None
+    entry_id: str,
+    force: bool = False,
+    source: Optional[Path] = None,
+    automatic: bool = False,
 ) -> bool:
     """Move a pending entry into the live library and commit it.
 
@@ -601,6 +608,18 @@ def approve(
     The entry's recorded checks describe the draft, so a refined directory is
     re-checked from scratch rather than approved on the strength of the
     proposal's clean bill of health.
+
+    ``automatic`` means the policy approved this, not a person. Two things
+    follow, and both matter more than they look:
+
+    - The recorded verdict is ``auto``, never ``always``. ``always`` silences
+      ``skillgate`` permanently, and retiring the queue *and* the use-time gate
+      in one step would leave a skill nobody ever looked at with nothing
+      standing between it and every future session.
+    - The skill goes on probation. A description enters every system prompt
+      whether or not the skill is ever invoked, so a library that only grows is
+      a cost that only grows. The curator retires what probation does not
+      justify.
     """
     entry = get(entry_id)
     if not entry:
@@ -635,11 +654,22 @@ def approve(
 
     sessions = entry.get("sessions") or [entry.get("session", "unknown")]
     guard.commit(
-        f"approved: {entry['skill']} ({entry['kind']})\n\n"
+        f"{'auto-approved' if automatic else 'approved'}: "
+        f"{entry['skill']} ({entry['kind']})\n\n"
         f"{entry.get('summary', '')}\n\n"
         f"Session: {', '.join(str(s) for s in sessions if s)}"
     )
-    set_approval(entry["skill"], "always")
+    set_approval(entry["skill"], "auto" if automatic else "always")
+    if automatic:
+        start_trial(entry["skill"])
+        log({
+            "event": "auto-approved",
+            "skill": entry["skill"],
+            "kind": entry["kind"],
+            "id": entry["id"],
+            "claims": len(entry.get("claims") or []),
+            "sessions": [str(s) for s in sessions if s],
+        })
     shutil.rmtree(root, ignore_errors=True)
     shutil.rmtree(refine_root() / entry["id"], ignore_errors=True)
     return True
@@ -755,6 +785,217 @@ def _top_confidence(claims: List[Dict[str, Any]]) -> str:
         if level in levels:
             return level
     return "unrated"
+
+
+# ---------------------------------------------------------------------------
+# Autonomous approval
+# ---------------------------------------------------------------------------
+#
+# The queue was added after the loop worked, and twelve days of data said it is
+# where the loop dies: 46 proposals, 0 approvals, nothing in the library. A
+# proposal nobody reads is not safer than one that landed -- it is the same
+# money spent for none of the benefit.
+#
+# So: a policy, not a blanket. What follows is the whole of what can reach the
+# library without a person, and every check in it already existed for the
+# human path. Nothing here is a new judgement about quality; it is the existing
+# judgements, applied without waiting.
+
+
+def _state_file() -> Path:
+    # Resolved at call time. ``review`` owns this file, but importing it here
+    # would be circular -- and worse, ``pending`` runs as __main__ under
+    # bin/patina, so the import would produce a second copy of the module.
+    return guard.STATE_DIR / "state.json"
+
+
+def read_state() -> Dict[str, Any]:
+    try:
+        return json.loads(_state_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(state: Dict[str, Any]) -> None:
+    guard.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _state_file().with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(_state_file())
+
+
+def _setting(state: Dict[str, Any], key: str, env_name: str, default):
+    """A state.json key, overridable by ``PATINA_<env_name>``."""
+    raw = guard.env(env_name)
+    if raw is None:
+        raw = state.get(key)
+    if raw is None:
+        return default
+    if isinstance(default, bool):
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    try:
+        return type(default)(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def autonomous(state: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether the loop may approve without asking.
+
+    Off by default, and deliberately: no version of this has ever written to a
+    real library, and the first one to do so should be switched on by someone
+    who decided to.
+    """
+    return _setting(state if state is not None else read_state(),
+                    "autonomous", "AUTONOMOUS", False)
+
+
+def auto_min_lessons(state: Dict[str, Any]) -> int:
+    return max(1, _setting(state, "auto_min_lessons", "AUTO_MIN_LESSONS", 2))
+
+
+def auto_max_patch_lines(state: Dict[str, Any]) -> int:
+    return max(1, _setting(state, "auto_max_patch_lines", "AUTO_MAX_PATCH_LINES", 120))
+
+
+def auto_trial_days(state: Dict[str, Any]) -> int:
+    return max(1, _setting(state, "auto_trial_days", "AUTO_TRIAL_DAYS", 14))
+
+
+def start_trial(skill: str) -> None:
+    """Put an auto-approved skill on probation.
+
+    Recorded in state rather than stamped into the skill's frontmatter: the
+    file is what the model wrote and what the user may later edit by hand, and
+    a bookkeeping field the loop rewrites is one more thing that can go wrong
+    in a file whose frontmatter has to stay loadable.
+    """
+    state = read_state()
+    state.setdefault("auto_approved", {})[skill] = {"since": now()}
+    write_state(state)
+
+
+def clear_trial(skill: str) -> None:
+    """It was loaded. It earned its place."""
+    state = read_state()
+    trials = state.get("auto_approved") or {}
+    if trials.pop(skill, None) is not None:
+        write_state(state)
+
+
+def expired_trials(state: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Auto-approved skills that were never loaded inside the trial window.
+
+    The curator acts on these. Without it autonomous mode is a ratchet: every
+    proposal that passes the policy adds weight to every later system prompt,
+    and nothing ever takes any of it off again.
+    """
+    state = read_state() if state is None else state
+    trials = state.get("auto_approved") or {}
+    usage = state.get("usage") or {}
+    window = dt.timedelta(days=auto_trial_days(state))
+    now_ts = dt.datetime.now(dt.timezone.utc)
+
+    expired = []
+    for skill, row in trials.items():
+        if (usage.get(skill) or {}).get("count"):
+            continue  # loaded at least once; the trial is over and it passed
+        try:
+            since = dt.datetime.fromisoformat(str(row.get("since")))
+        except (TypeError, ValueError):
+            continue
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=dt.timezone.utc)
+        if now_ts - since >= window:
+            expired.append(skill)
+    return sorted(expired)
+
+
+def auto_approve_queue(
+    dry_run: bool = False, only: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Run the policy over the queue, or over ``only`` those entries.
+
+    Returns what it took and what it left, with the reason for each. The
+    reasons are the point: a policy nobody can inspect is not meaningfully
+    different from no policy.
+
+    ``only`` is what the review and curate paths pass -- the entries they just
+    filed. Draining the whole backlog as a side effect of an unrelated session
+    is not the same decision as turning autonomous mode on, and must not happen
+    by accident. The CLI is where a person asks for that, deliberately.
+    """
+    state = read_state()
+    taken, left = [], []
+    for entry in entries():
+        if only is not None and entry["id"] not in only:
+            continue
+        reason = auto_verdict(entry, state)
+        if reason is not None:
+            left.append((entry["id"], reason))
+            continue
+        if dry_run or approve(entry["id"], automatic=True):
+            taken.append(entry["id"])
+        else:
+            left.append((entry["id"], "approve failed"))
+    return {"approved": taken, "held": left, "dry_run": dry_run}
+
+
+def _changed_lines(entry: Dict[str, Any]) -> int:
+    diff = entry.get("diff") or ""
+    return sum(
+        1 for line in diff.splitlines()
+        if line[:1] in "+-" and not line.startswith(("+++", "---"))
+    )
+
+
+def auto_verdict(
+    entry: Dict[str, Any], state: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    """``None`` to approve without asking, or the reason it has to wait.
+
+    Ordered cheapest-and-most-absolute first, so the reason reported is the one
+    that matters most rather than whichever check happened to run.
+    """
+    state = read_state() if state is None else state
+
+    # A standing human decision. Nothing in the policy outranks it, ever.
+    if approval_for(entry["skill"]) == "never":
+        return "you rejected this skill name before"
+
+    # Would not load, or would load and match nothing. --force exists for the
+    # human path and is unreachable from here by construction.
+    blockers = blocking_findings(entry)
+    if blockers:
+        return f"malformed: {blockers[0]}"
+
+    kind = entry.get("kind")
+    if kind == KIND_ARCHIVE:
+        # Retiring a skill someone is using is not maintenance, it is a
+        # surprise. Unused is the curator's own criterion and it is checkable.
+        usage = (read_state().get("usage") or {}).get(entry["skill"]) or {}
+        if usage.get("count"):
+            return f"in use ({usage['count']} loads) -- retiring it needs a person"
+        return None
+    if kind not in (KIND_NEW, KIND_PATCH):
+        return f"unrecognised kind {kind!r}"
+
+    claims = entry.get("claims") or []
+    if len(claims) < auto_min_lessons(state):
+        return (
+            f"{len(claims)} lesson(s), policy wants "
+            f"{auto_min_lessons(state)} -- one is an anecdote"
+        )
+    if _top_confidence(claims) != "high":
+        return f"strongest claim is {_top_confidence(claims)}, not high"
+
+    if kind == KIND_PATCH:
+        changed = _changed_lines(entry)
+        if changed > auto_max_patch_lines(state):
+            return (
+                f"{changed} changed lines is a rewrite, not a patch "
+                f"(limit {auto_max_patch_lines(state)})"
+            )
+    return None
 
 
 def cmd_list() -> int:
@@ -951,6 +1192,79 @@ def cmd_decide(
     return 0 if done else 1
 
 
+def cmd_auto(action: str) -> int:
+    """The autonomous-mode switch and its dry run."""
+    state = read_state()
+    if action in ("on", "off"):
+        state["autonomous"] = action == "on"
+        write_state(state)
+        log({"event": "autonomous", "enabled": state["autonomous"]})
+        if action == "on":
+            print(
+                "Autonomous mode ON.\n\n"
+                "From here, proposals that pass the policy land in your library "
+                "without\nasking. What that means in practice:\n\n"
+                f"  - Only high-confidence proposals with at least "
+                f"{auto_min_lessons(state)} lessons behind them.\n"
+                "  - Nothing malformed, and nothing whose name you have "
+                "rejected before.\n"
+                "  - Every one is a git commit in ~/.claude/skills you can "
+                "revert.\n"
+                f"  - Each is on trial for {auto_trial_days(state)} days: if "
+                "nothing loads it, the\n    curator archives it again.\n"
+                "  - The first time one actually runs, you are asked.\n\n"
+                "Your existing queue is untouched. To apply the policy to it:\n"
+                "  patina pending auto --dry-run    # see what it would take\n"
+                "  patina pending auto              # take it"
+            )
+        else:
+            print(
+                "Autonomous mode OFF. Proposals wait for you in "
+                "`patina pending list` again.\n"
+                "Anything already approved stays; trials already running still "
+                "expire."
+            )
+        return 0
+
+    if action == "status":
+        print(f"Autonomous mode: {'ON' if autonomous(state) else 'OFF'}")
+        print(f"  minimum lessons:  {auto_min_lessons(state)}")
+        print(f"  max patch lines:  {auto_max_patch_lines(state)}")
+        print(f"  trial window:     {auto_trial_days(state)} days")
+        trials = state.get("auto_approved") or {}
+        if trials:
+            usage = state.get("usage") or {}
+            print(f"\nOn trial ({len(trials)}):")
+            for skill, row in sorted(trials.items()):
+                loads = (usage.get(skill) or {}).get("count", 0)
+                print(f"  {skill:<40} since {str(row.get('since'))[:10]}  "
+                      f"loads: {loads}")
+            expired = expired_trials(state)
+            if expired:
+                print("\nTrial expired, the curator will archive: "
+                      + ", ".join(expired))
+        return 0
+
+    # dry-run / run
+    dry = action == "dry-run"
+    queue = entries()
+    if not queue:
+        print("Nothing pending.")
+        return 0
+    outcome = auto_approve_queue(dry_run=dry)
+    verb = "would approve" if dry else "approved"
+    print(f"{len(outcome['approved'])} {verb}, {len(outcome['held'])} held.\n")
+    for entry_id in outcome["approved"]:
+        print(f"  PASS  {entry_id}")
+    if outcome["approved"] and outcome["held"]:
+        print()
+    for entry_id, why in outcome["held"]:
+        print(f"  HOLD  {entry_id}\n        {why}")
+    if dry:
+        print("\nNothing was applied. Run without --dry-run to apply.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
@@ -973,8 +1287,18 @@ def main() -> int:
                 help="apply this directory instead of the queued draft "
                      "(what `refine` staged)",
             )
+    auto = sub.add_parser(
+        "auto", help="autonomous approval: on | off | status | --dry-run"
+    )
+    auto.add_argument("action", nargs="?", default="run",
+                      choices=["on", "off", "status", "run"])
+    auto.add_argument("--dry-run", action="store_true",
+                      help="report what the policy would take, apply nothing")
     args = parser.parse_args()
 
+    if args.command == "auto":
+        action = "dry-run" if getattr(args, "dry_run", False) else args.action
+        return cmd_auto(action)
     if args.command == "show":
         return cmd_show(args.id)
     if args.command == "refine":

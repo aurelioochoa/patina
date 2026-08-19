@@ -151,6 +151,7 @@ def test_every_skill_exists_and_parses():
         "curate",
         "pause",
         "patination",
+        "auto",
     }
 
 

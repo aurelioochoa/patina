@@ -7,12 +7,19 @@ hook has nothing to do. It exists for the paths quarantine does not cover -- a
 skill approved once and later edited by hand, an entry restored from git, a
 future code path that writes directly.
 
-Four states, per skill:
+Five states, per skill:
 
-    always   -- allow, never ask again
+    always   -- allow, never ask again (a person approved it)
+    auto     -- ask once per session (the policy approved it; nobody read it)
     never    -- deny, never ask again
     session  -- allow for this session only (keyed on the hook's session_id)
     unset    -- ask the user
+
+``auto`` is why this hook stopped being a formality. Under autonomous mode the
+queue no longer stands between a proposal and the library, so this is the only
+point where a person sees an auto-written skill before it does anything -- and
+it fires at the moment the skill is about to act, for the small subset of
+written skills that anything actually tries to use.
 
 Skills without ``metadata.autoManaged: true`` are none of our business and are
 always allowed: the user wrote them.
@@ -101,12 +108,22 @@ def decide(payload: Dict[str, Any]) -> tuple[str, str]:
     created_from = str(
         (frontmatter.get("metadata") or {}).get("createdFrom", "unknown")
     )
+    if verdict == "auto":
+        return "ask", (
+            f"'{name}' was written AND approved automatically by patina, the "
+            f"self-improvement loop (from session {created_from[:8]}). It passed "
+            f"the policy, but no person has read it. This is the first time "
+            f"anything has tried to use it.\n"
+            f"Inspect it first with:  cat {guard.SKILLS_DIR / name / 'SKILL.md'}\n"
+            f"Decide permanently:     patina pending approve {name}  |  "
+            f"patina pending reject {name}"
+        )
     return "ask", (
         f"'{name}' was written automatically by patina, the self-improvement loop, "
         f"(from session {created_from[:8]}), not by you. Approve using it?\n"
         f"Inspect it first with:  cat {guard.SKILLS_DIR / name / 'SKILL.md'}\n"
-        f"Decide permanently:     pending.py approve {name}  |  "
-        f"pending.py reject {name}"
+        f"Decide permanently:     patina pending approve {name}  |  "
+        f"patina pending reject {name}"
     )
 
 

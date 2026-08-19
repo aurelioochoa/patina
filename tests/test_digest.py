@@ -211,6 +211,63 @@ def test_a_control_byte_in_the_session_metadata_is_stripped_too(tmp_path):
     assert "\x00" not in digest.build(path).text
 
 
+# --- compaction instead of truncation --------------------------------------
+
+
+def test_summarise_older_returns_only_the_older_turns(tmp_path):
+    records = []
+    for i in range(40):
+        records += [user(f"question {i}"), assistant(f"answer {i}")]
+    path = write_transcript(tmp_path, records)
+    messages, _ = digest.parse_transcript(path)
+
+    older = digest.summarise_older(messages, tail=4)
+    assert "question 0" in older
+    # The last four messages are the tail and are not this function's business.
+    assert "answer 39" not in older
+
+
+def test_older_override_replaces_the_generated_summary(tmp_path):
+    records = []
+    for i in range(40):
+        records += [user(f"question {i}"), assistant(f"answer {i}")]
+    path = write_transcript(tmp_path, records)
+    messages, meta = digest.parse_transcript(path)
+
+    result = digest.render(
+        messages, meta, tail=4, older_override="THE COMPACTION"
+    )
+    assert "THE COMPACTION" in result.text
+    assert "question 0" not in result.text
+    # The verbatim tail is untouched -- it carries the corrections.
+    assert "answer 39" in result.text
+
+
+def test_turns_falling_out_of_the_tail_are_not_lost_under_an_override(tmp_path):
+    """The override covers the turns older than the tail it was built for. If
+    the tail then shrinks to fit, what falls out of it must still be reported,
+    not silently dropped because the compaction predates it."""
+    records = []
+    for i in range(40):
+        records += [user(f"question {i}"), assistant("x" * 400)]
+    path = write_transcript(tmp_path, records)
+    messages, meta = digest.parse_transcript(path)
+
+    result = digest.render(
+        messages, meta, tail=24, max_chars=3_000, older_override="THE COMPACTION"
+    )
+    assert "THE COMPACTION" in result.text
+    assert result.truncated
+    # question 29 was inside the original tail and outside the shrunken one.
+    assert "question 29" in result.text
+
+
+def test_the_ceiling_is_sized_for_the_budget_not_the_argv_limit():
+    """120_000 chars plus a prompt template crossed MAX_ARG_STRLEN (131072)
+    and spent the whole per-fork ceiling replaying the session."""
+    assert digest.DEFAULT_MAX_CHARS <= 60_000
+
+
 if __name__ == "__main__":
     import subprocess
 

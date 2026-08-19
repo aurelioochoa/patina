@@ -23,9 +23,15 @@ from typing import Any, Dict, List, Optional
 #: Messages kept verbatim at the tail.
 DEFAULT_TAIL = 24
 
-#: Ceiling on the rendered digest. Roughly 30k tokens -- generous for a review
-#: fork, small enough that a 4.7 MB transcript cannot blow up the run.
-DEFAULT_MAX_CHARS = 120_000
+#: Ceiling on the rendered digest. Roughly 15k tokens.
+#:
+#: It was 120_000, which was two separate mistakes at once. A digest that large
+#: plus a prompt template crosses ``MAX_ARG_STRLEN`` and the fork could not even
+#: start; and a fork that did start spent the whole per-pass budget replaying
+#: the session instead of thinking about it. Both showed up in the wild within
+#: twelve days. Overflow above this is now compacted by a cheap model rather
+#: than cut off mid-sentence -- see ``summarise_older`` and ``older_override``.
+DEFAULT_MAX_CHARS = 60_000
 
 #: Truncation widths for collapsed older turns, matching Hermes.
 _USER_SUMMARY_CHARS = 300
@@ -280,13 +286,41 @@ def _render(message: Message) -> str:
     return " ".join(parts)
 
 
+def summarise_older(messages: List[Message], tail: int = DEFAULT_TAIL) -> str:
+    """The older-turn collapse on its own, as text.
+
+    Exposed because it is the half worth spending a model on: a caller can hand
+    this to a cheap compaction fork and pass the result back as
+    ``older_override``, which is how a long session gets condensed instead of
+    truncated. Pure, like everything else here -- the forking belongs to the
+    caller.
+    """
+    kept = max(0, min(tail, len(messages)))
+    older = messages[: len(messages) - kept] if kept else messages
+    return "\n".join(s for s in (_summarise(m) for m in older) if s)
+
+
 def render(
     messages: List[Message],
     meta: Digest,
     tail: int = DEFAULT_TAIL,
-    max_chars: int = DEFAULT_MAX_CHARS,
+    max_chars: Optional[int] = None,
+    older_override: Optional[str] = None,
 ) -> Digest:
-    """Build the digest text, shrinking the verbatim tail until it fits."""
+    """Build the digest text, shrinking the verbatim tail until it fits.
+
+    ``older_override`` replaces the generated summary of the older turns with
+    text the caller prepared -- a compaction. It must have been built with the
+    same ``tail``: if the tail then has to shrink to fit, the turns that fall
+    out of it are summarised the ordinary way and appended, so nothing is
+    dropped silently just because it was not in the compaction.
+
+    ``max_chars`` is resolved here, never bound as a default argument: a default
+    would freeze the ceiling at import and leave the module constant unchangeable
+    by anything -- a caller, a test, a future knob.
+    """
+    if max_chars is None:
+        max_chars = DEFAULT_MAX_CHARS
     header = [
         "[Session context]",
         f"cwd: {meta.cwd or 'unknown'}",
@@ -305,7 +339,8 @@ def render(
         header.append(f"unparseable transcript lines skipped: {meta.skipped_lines}")
     header_text = "\n".join(header)
 
-    current_tail = max(0, min(tail, len(messages)))
+    start_tail = max(0, min(tail, len(messages)))
+    current_tail = start_tail
     truncated = False
 
     while True:
@@ -314,11 +349,23 @@ def render(
 
         sections = [header_text]
         if older:
-            summary = [s for s in (_summarise(m) for m in older) if s]
+            if older_override is None:
+                body = "\n".join(
+                    s for s in (_summarise(m) for m in older) if s
+                )
+            else:
+                # The override covers the turns older than ``start_tail``. Any
+                # that have since fallen out of the shrinking tail are not in
+                # it, and are summarised here rather than lost.
+                spill = messages[len(messages) - start_tail : len(messages) - current_tail]
+                body = "\n".join(
+                    [older_override]
+                    + [s for s in (_summarise(m) for m in spill) if s]
+                )
             sections.append(
                 "[Earlier conversation digest -- older turns summarised to bound "
                 "the review's cold-start cost. Recent turns follow verbatim.]\n"
-                + "\n".join(summary)
+                + body
             )
         if recent:
             sections.append(
@@ -347,11 +394,15 @@ def render(
 def build(
     path: str | Path,
     tail: int = DEFAULT_TAIL,
-    max_chars: int = DEFAULT_MAX_CHARS,
+    max_chars: Optional[int] = None,
+    older_override: Optional[str] = None,
 ) -> Digest:
     """Transcript path -> rendered digest."""
     messages, meta = parse_transcript(path)
-    return render(messages, meta, tail=tail, max_chars=max_chars)
+    return render(
+        messages, meta, tail=tail, max_chars=max_chars,
+        older_override=older_override,
+    )
 
 
 if __name__ == "__main__":

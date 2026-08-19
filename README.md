@@ -60,7 +60,8 @@ what it says it learned:
 ```
 
 If the claim is right, you approve it and Claude knows it from then on. If it's wrong, you
-reject it and it's gone. **Nothing reaches your skill library unless you say so.**
+reject it and it's gone. **Nothing reaches your skill library unless you say so** — until you
+decide otherwise, which is what [autonomous mode](#autonomous-mode) is for.
 
 ---
 
@@ -94,6 +95,7 @@ That's it. The loop starts working at the end of your next session.
 | `/patina:patination` | Review the session you're in right now, without waiting for it to end |
 | `/patina:curate` | Tidy the library now, instead of waiting for the weekly pass |
 | `/patina:pause` | Stop the scheduled work (`resume` to start again) |
+| `/patina:auto` | Let the loop approve for itself — `--dry-run` first, always |
 
 Only you can run these. They're marked `disable-model-invocation: true`, which is deliberate
 rather than tidy — they spend money and change what loads into every later session. A model
@@ -292,7 +294,13 @@ plugin loaded with `--plugin-dir` leaves no trace on disk, so that case is on yo
 | `PATINA_STATE_DIR` | `~/.claude/patina` | redirect state |
 | `PATINA_PROJECTS_DIR` | `~/.claude/projects` | redirect transcript discovery |
 | `PATINA_WORK_DIR` | `~/.cache/patina` | scratch tree handed to the fork |
-| `PATINA_MAX_USD` | `0.50` | hard spend ceiling per fork |
+| `PATINA_MAX_USD` | `0.50` | shared spend ceiling per fork |
+| `PATINA_COMPACT_MAX_USD` | `0.25` | ceiling for the compaction pass |
+| `PATINA_REFLECT_MAX_USD` | `PATINA_MAX_USD` | ceiling for the reading pass |
+| `PATINA_PLACE_MAX_USD` | `0.75` | ceiling for the writing pass |
+| `PATINA_CURATOR_MAX_USD` | `PATINA_MAX_USD` | ceiling for the curator |
+| `PATINA_COMPACT_MODEL` | `haiku` | model that condenses an oversized digest |
+| `PATINA_AUTONOMOUS` | `false` | approve without asking (see below) |
 | `PATINA_FALLBACK_MODEL` | unset | model to fall back to when the primary is unavailable |
 
 The pre-rename `CLAUDE_SELF_IMPROVE_*` spellings still work as a fallback, so an old export in
@@ -307,6 +315,75 @@ Intervals live in `state.json`:
 | `sweep_limit` | `10` | forks per sweep — a spend ceiling as much as a batch size |
 | `min_tool_calls` | `8` | below this *and* `min_user_turns`, a session isn't reviewed |
 | `min_user_turns` | `5` | either signal alone is enough to earn a review |
+| `autonomous` | `false` | approve without asking |
+| `auto_min_lessons` | `2` | evidence a proposal needs to auto-approve |
+| `auto_max_patch_lines` | `120` | above this a patch is a rewrite, and waits |
+| `auto_trial_days` | `14` | how long an auto-approved skill has to get used |
+
+---
+
+## Autonomous mode
+
+The queue has one failure mode, and it is the common one: you never read it. Twelve days of
+running this produced 46 proposals, $35 of reviews, and zero approvals — which is the same
+money as never running it at all, and none of the benefit.
+
+So the queue can be replaced by a policy:
+
+```sh
+$ /patina:auto --dry-run
+
+31 would approve, 16 held.
+
+  PASS  safe-irreversible-git-github-ops-a064dedb
+  ...
+  HOLD  vendoring-third-party-web-builds-merged-2
+        you rejected this skill name before
+  HOLD  css-animation-techniques-4a5064b4
+        strongest claim is medium, not high
+  HOLD  building-claude-code-plugins-a8545518
+        malformed: name contains the reserved word 'claude'
+```
+
+Read the held column before the passed one. It is where you find out whether the policy
+agrees with you.
+
+**What lands on its own.** All of these, or it waits:
+
+- No blocking lint findings. `--force` exists for you and is unreachable from the policy.
+- No name you have rejected before. That verdict outranks everything here, permanently.
+- At least `auto_min_lessons` claims behind it, strongest rated `high`. One lesson is an
+  anecdote.
+- A patch under `auto_max_patch_lines` changed lines. Bigger than that is a rewrite.
+- An archival only when nothing has ever loaded the skill. Retiring something you use is a
+  surprise, not maintenance.
+
+**What you get instead of the queue.** The promise changes, and it is worth reading as a
+whole rather than taking on trust:
+
+> Nothing reaches your library unless it passes a policy you set. Everything that lands is
+> one git commit you can revert. Anything that lands and goes unused is retired
+> automatically. And the first time an auto-approved skill actually runs, you are asked.
+
+Each clause is a mechanism, not a reassurance:
+
+- **One git commit.** `~/.claude/skills` is a git repository and every write is a commit
+  naming the skill, the kind of change, and the sessions behind it. `git revert` is the undo.
+- **Retired automatically.** An auto-approved skill is on trial for `auto_trial_days`. If
+  nothing loads it in that window, the curator archives it — contents and history intact.
+  This is the half that matters: a skill's *description* enters the system prompt of every
+  later session whether or not it is ever invoked, so a library that only grows is a tax that
+  only grows.
+- **You are asked.** An auto-approval records the verdict `auto`, not `always`. The
+  `PreToolUse` gate treats `auto` as *ask once per session*, so the first time anything tries
+  to use a skill no person has read, you see it — at the moment it is about to do work,
+  rather than as one diff among 46.
+
+Turning it on leaves your existing queue alone. Applying the policy to a backlog is a
+separate, deliberate `/patina:auto` after you have read the dry run.
+
+Off by default. No version of this has ever written to a real library, and the first one to
+do so should be switched on by someone who decided to.
 
 ---
 
@@ -415,6 +492,9 @@ nombre es válido, si la descripción es demasiado larga, si está escrita en pr
 su disparador choca con un skill que ya tienes. Cualquier problema que impediría que el skill
 cargue bloquea la aprobación.
 
+Eso mientras el modo autónomo esté apagado, que es como viene. Encendido, la cola la lee una
+política en tu lugar — ver [Modo autónomo](#modo-autónomo).
+
 **¿Por qué una cola, en vez de solo preguntar al usarlo?** Porque el nombre y la descripción
 de un skill entran al prompt del sistema en cada sesión, se invoque o no. Un mal skill guardado
 en tu biblioteca consume contexto y sesga el comportamiento sin que la herramienta `Skill` se
@@ -472,6 +552,7 @@ Listo. El proceso empieza a trabajar al final de tu siguiente sesión.
 | `/patina:patination` | Revisar la sesión en curso, sin esperar a que termine |
 | `/patina:curate` | Ordenar la biblioteca ahora, sin esperar a la pasada semanal |
 | `/patina:pause` | Detener el trabajo programado (`resume` para reanudar) |
+| `/patina:auto` | Dejar que el proceso apruebe solo — siempre `--dry-run` primero |
 
 Solo tú puedes ejecutarlos. Llevan `disable-model-invocation: true` a propósito: gastan dinero
 y cambian lo que se carga en todas las sesiones siguientes. Un modelo con libertad para
@@ -492,6 +573,48 @@ metadata:
 ```
 
 Quita la marca para recuperarlo.
+
+### Modo autónomo
+
+La cola tiene un modo de fallo, y es el habitual: nunca la lees. Doce días de esto produjeron
+46 propuestas, $35 en revisiones y cero aprobaciones — el mismo dinero que no haberlo
+ejecutado nunca, y ninguno de los beneficios.
+
+Así que la cola se puede reemplazar por una política. `/patina:auto --dry-run` no aplica nada
+y te dice qué tomaría y qué retendría, con el motivo de cada retención. Lee primero la columna
+de retenidos: ahí es donde descubres si la política piensa como tú.
+
+**Qué entra solo.** Todo esto, o espera: sin hallazgos bloqueantes del lint (`--force` existe
+para ti y la política no puede alcanzarlo); ningún nombre que ya hayas rechazado — ese veredicto
+manda sobre todo lo demás, para siempre; al menos `auto_min_lessons` afirmaciones detrás, la
+más fuerte en `high`; un parche por debajo de `auto_max_patch_lines` líneas; y un archivado
+solo cuando nada ha cargado nunca ese skill.
+
+**Qué recibes en lugar de la cola:**
+
+> Nada llega a tu biblioteca sin pasar una política que tú defines. Todo lo que entra es un
+> commit de git que puedes revertir. Lo que entra y nadie usa se retira solo. Y la primera vez
+> que un skill aprobado automáticamente se ejecute, se te pregunta.
+
+Cada cláusula es un mecanismo, no una promesa:
+
+- **Un commit.** `~/.claude/skills` es un repositorio git y cada escritura es un commit con el
+  skill, el tipo de cambio y las sesiones detrás. `git revert` es el deshacer.
+- **Se retira solo.** Un skill aprobado por la política queda a prueba `auto_trial_days` días.
+  Si nada lo carga en esa ventana, el curador lo archiva — con su contenido y su historia
+  intactos. Esta es la mitad que importa: la *descripción* de un skill entra al prompt del
+  sistema de todas las sesiones siguientes se invoque o no, así que una biblioteca que solo
+  crece es un impuesto que solo crece.
+- **Se te pregunta.** Una aprobación automática registra el veredicto `auto`, no `always`. El
+  gancho `PreToolUse` trata `auto` como *preguntar una vez por sesión*, así que la primera vez
+  que algo intente usar un skill que ninguna persona ha leído, lo ves — en el momento en que va
+  a actuar, y no como un diff entre 46.
+
+Encenderlo no toca tu cola actual. Aplicar la política a lo acumulado es un `/patina:auto`
+aparte y deliberado, después de leer el `--dry-run`.
+
+Apagado por defecto. Ninguna versión de esto ha escrito nunca en una biblioteca real, y la
+primera que lo haga debería encenderla alguien que lo decidió.
 
 ### Dos números que vale la pena vigilar
 

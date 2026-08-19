@@ -368,6 +368,36 @@ def test_fork_command_passes_a_schema_as_json(skills):
     assert json.loads(command[command.index("--json-schema") + 1]) == schema
 
 
+def test_fork_command_leaves_the_prompt_out_of_argv_by_default(skills):
+    """The prompt goes on stdin. Linux caps one argv string at MAX_ARG_STRLEN
+    (131072 bytes) and a real digest plus a template crossed it, raising
+    OSError(7) before the fork started."""
+    command = guard.fork_command(model="sonnet", max_turns=30)
+    assert command[:2] == ["claude", "-p"]
+    assert command[2] == "--model"
+    # Every guard still present without the prompt.
+    assert "--no-session-persistence" in command
+    assert "--strict-mcp-config" in command
+    assert "--disallowedTools" in command
+
+
+def test_fork_command_still_accepts_a_prompt_argument(skills):
+    command = guard.fork_command("prompt", model="sonnet", max_turns=30)
+    assert command[:3] == ["claude", "-p", "prompt"]
+
+
+def test_fork_command_takes_a_per_pass_ceiling(skills):
+    command = guard.fork_command(
+        model="sonnet", max_turns=1, max_budget_usd="0.10"
+    )
+    assert command[command.index("--max-budget-usd") + 1] == "0.10"
+
+
+def test_fork_command_falls_back_to_the_shared_ceiling(skills):
+    command = guard.fork_command(model="sonnet", max_turns=1)
+    assert command[command.index("--max-budget-usd") + 1] == guard.MAX_BUDGET_USD
+
+
 # --- reading what the fork returned ----------------------------------------
 
 

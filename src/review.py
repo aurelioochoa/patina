@@ -297,6 +297,77 @@ LESSONS_SCHEMA = {
 #: The reflect pass has no tools and one thing to say.
 REFLECT_MAX_TURNS = 3
 
+#: The compaction pass. A cheap model, one turn, no tools -- it only rewrites
+#: text it is handed. Its own ceiling, an order of magnitude below the passes
+#: that think, because paying review prices to shorten a transcript is how the
+#: budget got spent on transcripts instead of lessons.
+COMPACT_MODEL = guard.env("COMPACT_MODEL", "haiku")
+COMPACT_MAX_TURNS = 1
+
+
+def build_compact_prompt(older_text: str, target_chars: int) -> str:
+    template = (PROMPTS_DIR / "compact.md").read_text(encoding="utf-8")
+    return guard.FORK_MARKER + "\n\n" + (
+        template.replace("{target_chars}", str(target_chars))
+        .replace("{older}", older_text)
+    )
+
+
+def compact_digest(
+    transcript: Path, built: "digest_mod.Digest", session_id: str
+) -> tuple:
+    """Condense the older turns instead of cutting them off at the ceiling.
+
+    Only the older turns. The recent tail is where the corrections live and it
+    is passed through untouched, for the same reason ``render`` shrinks the tail
+    last rather than first.
+
+    Returns the digest to use and the fork's result for cost accounting. Every
+    failure path returns the truncated digest unchanged: a compaction that did
+    not work is a worse review, while a compaction that takes the review down
+    with it is no review at all.
+    """
+    messages, meta = digest_mod.parse_transcript(transcript)
+    older = digest_mod.summarise_older(messages, digest_mod.DEFAULT_TAIL)
+    if not older.strip():
+        return built, None
+
+    target = digest_mod.DEFAULT_MAX_CHARS // 2
+    try:
+        result = run_fork(
+            build_compact_prompt(older, target),
+            tools=[],
+            max_turns=COMPACT_MAX_TURNS,
+            model=COMPACT_MODEL,
+            max_budget_usd=guard.COMPACT_MAX_USD,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError, OSError) as exc:
+        log({"event": "compact-failed", "session": session_id,
+             "reason": repr(exc)})
+        return built, None
+
+    outcome = guard.parse_fork_result(result.stdout)
+    _log_budget(session_id, result.returncode, outcome,
+                "compact", guard.COMPACT_MAX_USD)
+    text = (outcome.text or "").strip()
+    if result.returncode != 0 or not text:
+        log({"event": "compact-failed", "session": session_id,
+             "exit": result.returncode, "cost_usd": outcome.cost_usd,
+             "stderr": (result.stderr or "")[:500]})
+        return built, outcome
+
+    compacted = digest_mod.render(messages, meta, older_override=text)
+    log({
+        "event": "compacted",
+        "session": session_id,
+        "model": COMPACT_MODEL,
+        "before_chars": len(built.text),
+        "after_chars": len(compacted.text),
+        "still_truncated": compacted.truncated,
+        "cost_usd": outcome.cost_usd,
+    })
+    return compacted, outcome
+
 
 def build_reflect_prompt(digest_text: str, session_id: str) -> str:
     template = (PROMPTS_DIR / "reflect.md").read_text(encoding="utf-8")
@@ -432,23 +503,31 @@ def run_fork(
     tools: Optional[list] = None,
     schema: Optional[Dict[str, Any]] = None,
     max_turns: int = MAX_TURNS,
+    model: str = MODEL,
+    max_budget_usd: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Spawn the restricted headless child.
 
     ``--add-dir`` is a harness-level boundary and the first line of defence;
     ``guard.verify_writes`` afterwards is the one that actually decides.
+
+    The prompt goes to the child's stdin, never into argv. A digest large enough
+    to matter plus a prompt template crosses ``MAX_ARG_STRLEN`` (131072 bytes),
+    and the two largest sessions this loop ever saw died at ``OSError(7)``
+    before the fork started. Nothing bounds stdin.
     """
     work = guard.WORK_DIR
     command = guard.fork_command(
-        prompt,
-        model=MODEL,
+        model=model,
         max_turns=max_turns,
         add_dirs=[work] if tools != [] else [],
         tools=tools,
         schema=schema,
+        max_budget_usd=max_budget_usd,
     )
     return subprocess.run(
         command,
+        input=prompt,
         cwd=str(work),
         capture_output=True,
         text=True,
@@ -458,17 +537,27 @@ def run_fork(
     )
 
 
-def _log_budget(session_id: str, returncode: int, outcome: "guard.ForkResult") -> None:
+def _log_budget(
+    session_id: str,
+    returncode: int,
+    outcome: "guard.ForkResult",
+    pass_name: str = "",
+    limit_usd: Optional[str] = None,
+) -> None:
     """Record a fork that stopped at the spend ceiling rather than crashing.
 
     Retrying spends two more forks on a number that is too low, so this needs to
     be visible in --status as its own thing, not filed as an unexplained failure.
+
+    Which pass and which ceiling, because the passes no longer share one number
+    and "budget-exhausted" alone does not say what to raise.
     """
     if returncode != 0 and outcome.hit_budget:
         log({
             "event": "budget-exhausted",
             "session": session_id,
-            "limit_usd": guard.MAX_BUDGET_USD,
+            "pass": pass_name,
+            "limit_usd": limit_usd if limit_usd is not None else guard.MAX_BUDGET_USD,
         })
 
 
@@ -538,7 +627,16 @@ def review(
             f"user_turns={built.user_turns} (min {min_turns}) -> "
             f"{'SKIP, too thin' if thin else 'review'}\n"
             f"--- would fork: model={MODEL} messages={built.message_count} "
-            f"truncated={built.truncated}",
+            f"truncated={built.truncated}\n"
+            f"--- digest: {len(built.text)} chars "
+            f"(ceiling {digest_mod.DEFAULT_MAX_CHARS}), reflect prompt "
+            f"{len(build_reflect_prompt(built.text, session_id).encode())} bytes\n"
+            f"--- compaction: "
+            + (
+                f"would run on {COMPACT_MODEL} -- the digest was cut"
+                if built.truncated
+                else "not needed, the digest fits"
+            ),
             file=sys.stderr,
         )
         return 0
@@ -571,6 +669,12 @@ def review(
         guard.ensure_skills_repo()
         started = now()
 
+        # The digest did not fit and was cut. Buy the lost turns back with a
+        # cheap model rather than reviewing a session with its middle missing.
+        compacted = None
+        if built.truncated:
+            built, compacted = compact_digest(transcript, built, session_id)
+
         # Pass 1: read the session, distil lessons, touch nothing. No tools and
         # no --add-dir, so the pass that sees raw transcript text -- web pages,
         # file contents, command output, anything a session happened to read --
@@ -581,6 +685,7 @@ def review(
                 tools=[],
                 schema=LESSONS_SCHEMA,
                 max_turns=REFLECT_MAX_TURNS,
+                max_budget_usd=guard.REFLECT_MAX_USD,
             )
         except subprocess.TimeoutExpired:
             log({"event": "timeout", "session": session_id, "pass": "reflect",
@@ -601,10 +706,12 @@ def review(
             return 0
 
         reflected = guard.parse_fork_result(first.stdout)
-        _log_budget(session_id, first.returncode, reflected)
+        _log_budget(session_id, first.returncode, reflected,
+                    "reflect", guard.REFLECT_MAX_USD)
         if first.returncode != 0:
             log({"event": "reflect-failed", "session": session_id,
-                 "exit": first.returncode, "cost_usd": reflected.cost_usd,
+                 "exit": first.returncode,
+                 "cost_usd": _total_cost(compacted, reflected),
                  "stderr": (first.stderr or "")[:1000]})
             _record_failure(
                 session_id, transcript, reflected, f"reflect exit {first.returncode}"
@@ -637,7 +744,7 @@ def review(
                 "digest_chars": len(built.text),
                 "truncated": built.truncated,
                 "exit": 0,
-                "cost_usd": reflected.cost_usd,
+                "cost_usd": _total_cost(compacted, reflected),
                 "lessons": 0,
                 "queued": [],
                 "violations": [],
@@ -649,7 +756,10 @@ def review(
         # Pass 2: place the lessons. This one can write, and never sees the
         # transcript.
         try:
-            second = run_fork(build_place_prompt(lessons, session_id, note))
+            second = run_fork(
+                build_place_prompt(lessons, session_id, note),
+                max_budget_usd=guard.PLACE_MAX_USD,
+            )
         except subprocess.TimeoutExpired:
             log({"event": "timeout", "session": session_id, "pass": "place",
                  "seconds": TIMEOUT_SECONDS})
@@ -666,7 +776,8 @@ def review(
 
         result = second
         outcome = guard.parse_fork_result(second.stdout)
-        _log_budget(session_id, second.returncode, outcome)
+        _log_budget(session_id, second.returncode, outcome,
+                    "place", guard.PLACE_MAX_USD)
 
         # The fork never saw SKILLS_DIR, so there is nothing to revert there.
         # verify_writes stays as a cheap assertion that this remains true.
@@ -675,6 +786,20 @@ def review(
         normalize_new_skills(session_id)
         queued = pending.capture(session_id, summary=reply[:500], claims=lessons)
         sha = None
+
+        # Autonomous mode: apply the policy to what this review just filed, and
+        # nothing else. Draining the standing backlog is a separate decision a
+        # person makes with `patina pending auto`, not something an unrelated
+        # session does on their behalf.
+        auto = None
+        if queued and pending.autonomous():
+            auto = pending.auto_approve_queue(only=queued)
+            log({
+                "event": "auto-approval-pass",
+                "session": session_id,
+                "approved": auto["approved"],
+                "held": [f"{i}: {why}" for i, why in auto["held"]],
+            })
 
         log(
             {
@@ -687,10 +812,11 @@ def review(
                 "digest_chars": len(built.text),
                 "truncated": built.truncated,
                 "exit": result.returncode,
-                "cost_usd": _total_cost(reflected, outcome),
+                "cost_usd": _total_cost(compacted, reflected, outcome),
                 "lessons": len(lessons),
                 "commit": sha,
                 "queued": queued,
+                "auto_approved": (auto or {}).get("approved") or [],
                 "violations": violations,
                 "reply": reply[:2000],
                 "stderr": (result.stderr or "")[:1000] if result.returncode else "",
@@ -739,7 +865,12 @@ def show_status() -> int:
     print(f"Total reviews:        {len(reviews)}")
     print(f"Last 30 days:         {len(recent)}")
     print(f"Last run:             {reviews[-1]['at'] if reviews else 'never'}")
-    print(f"Spend, last 30 days:  ${spend:.2f} (ceiling ${guard.MAX_BUDGET_USD}/fork)")
+    print(f"Spend, last 30 days:  ${spend:.2f}")
+    print(
+        f"Ceilings per fork:    compact ${guard.COMPACT_MAX_USD}  "
+        f"reflect ${guard.REFLECT_MAX_USD}  place ${guard.PLACE_MAX_USD}  "
+        f"curate ${guard.CURATOR_MAX_USD}"
+    )
     print(f"Runs with violations: {len(violations)}")
     if violations:
         print("\nAllowlist violations (reverted):")
@@ -747,11 +878,32 @@ def show_status() -> int:
             for path in entry["violations"]:
                 print(f"  {entry['at']}  {path}")
     if budget_stops:
+        by_pass = {}
+        for entry in budget_stops:
+            by_pass[entry.get("pass") or "?"] = by_pass.get(entry.get("pass") or "?", 0) + 1
+        where = ", ".join(f"{name} x{count}" for name, count in sorted(by_pass.items()))
         print(
-            f"\n{len(budget_stops)} run(s) stopped at the spend ceiling. "
-            "Raise PATINA_MAX_USD to review those sessions -- they are not "
-            "retried,\nbecause the next attempt would stop at the same number."
+            f"\n{len(budget_stops)} run(s) stopped at the spend ceiling ({where}). "
+            "Raise that pass's\nceiling to review those sessions -- they are not "
+            "retried, because the next\nattempt would stop at the same number."
         )
+
+    compacted = [e for e in entries if e.get("event") == "compacted"]
+    compact_failed = [e for e in entries if e.get("event") == "compact-failed"]
+    if compacted or compact_failed:
+        print(f"\nDigests compacted:    {len(compacted)}")
+        if compacted:
+            saved = sum(
+                int(e.get("before_chars") or 0) - int(e.get("after_chars") or 0)
+                for e in compacted
+            )
+            print(f"  {saved:,} characters of transcript condensed rather than cut.")
+        if compact_failed:
+            print(
+                f"  {len(compact_failed)} compaction(s) failed; those reviews "
+                "fell back to truncating\n  the digest, which is the old "
+                "behaviour rather than a lost review."
+            )
     limited = [e for e in entries if e.get("event") == "rate-limited"]
     if limited:
         print(
@@ -780,9 +932,32 @@ def show_status() -> int:
             "review will read\n  as a no-op whether or not it found anything."
         )
 
+    state = read_state()
+    print(
+        f"\nAutonomous mode:      "
+        f"{'ON' if pending.autonomous(state) else 'OFF'}"
+    )
+    auto_approved = [e for e in entries if e.get("event") == "auto-approved"]
+    trials = state.get("auto_approved") or {}
+    if auto_approved or trials:
+        print(f"  Approved by policy: {len(auto_approved)}")
+        print(f"  Still on trial:     {len(trials)}")
+        expired = pending.expired_trials(state)
+        if expired:
+            print(
+                f"  Trial expired:      {len(expired)} "
+                "-- the curator will archive them: " + ", ".join(expired[:5])
+            )
+    elif not pending.autonomous(state):
+        print(
+            "  Proposals wait in `patina pending list`. "
+            "`patina pending auto --dry-run`\n"
+            "  reports what a policy would take, applying nothing."
+        )
+
     # The question this loop exists to answer. Everything above measures how
     # hard it worked; this measures whether any of it landed.
-    usage = read_state().get("usage", {}) or {}
+    usage = state.get("usage", {}) or {}
     owned = [path.parent.name for path in guard.writable_skills()]
     if owned:
         used = [name for name in owned if (usage.get(name) or {}).get("count")]
@@ -849,6 +1024,14 @@ def main() -> int:
         return review(transcript, session_id, cwd, dry_run=args.dry_run)
     except Exception as exc:  # noqa: BLE001 — the hook must never break a session
         log({"event": "error", "reason": repr(exc), "session": session_id})
+        # An exception here used to leave the watermark and the attempt count
+        # untouched, so the sweep picked the same transcript up again the next
+        # day, and every day after: one session raised the identical OSError
+        # nine minutes apart and would have gone on doing it. Spending an
+        # attempt is what makes an unforeseen failure terminate. The retry
+        # budget still applies, so a transient exception gets its three tries.
+        if session_id and transcript.exists():
+            mark_failed(session_id, transcript, repr(exc))
         return 0
 
 

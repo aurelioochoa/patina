@@ -32,6 +32,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -290,15 +291,17 @@ ACTIONS_SCHEMA = {
 
 
 def run_fork(prompt: str) -> subprocess.CompletedProcess:
+    """The curation fork. Prompt on stdin, never in argv -- see review.run_fork."""
     command = guard.fork_command(
-        prompt,
         model=MODEL,
         max_turns=40,
         add_dirs=[guard.WORK_DIR],
         schema=ACTIONS_SCHEMA,
+        max_budget_usd=guard.CURATOR_MAX_USD,
     )
     return subprocess.run(
         command,
+        input=prompt,
         cwd=str(guard.WORK_DIR),
         capture_output=True,
         text=True,
@@ -347,8 +350,19 @@ def curate() -> int:
     )
     # Consolidations and archivals go through the same review queue as
     # everything else. A curator that could silently merge two skills would be
-    # a bigger hole than the one the queue was built to close.
+    # a bigger hole than the one the queue was built to close -- so under
+    # autonomous mode they go through the same *policy* too, which holds back
+    # anything malformed, thinly evidenced, or retiring a skill in use.
     queued = pending.capture(f"curator-{now().date().isoformat()}", summary=reply[:500])
+    auto = None
+    if queued and pending.autonomous():
+        auto = pending.auto_approve_queue(only=queued)
+        review_mod.log({
+            "event": "auto-approval-pass",
+            "session": f"curator-{now().date().isoformat()}",
+            "approved": auto["approved"],
+            "held": [f"{i}: {why}" for i, why in auto["held"]],
+        })
     review_mod.log(
         {
             "event": "curate",
@@ -357,12 +371,62 @@ def curate() -> int:
             "actions": actions,
             "largest_risk": str(report.get("largest_risk") or "")[:500],
             "queued": queued,
+            "auto_approved": (auto or {}).get("approved") or [],
             "violations": violations,
             "reply": reply[:2000],
             "stderr": (result.stderr or "")[:1000] if result.returncode else "",
         }
     )
+    retire_expired_trials()
     return 0
+
+
+def retire_expired_trials() -> int:
+    """Take back what autonomous mode gave and nothing ever used.
+
+    A skill's description enters every system prompt whether or not the skill is
+    ever invoked, so a library that only grows is a tax that only grows. This is
+    the half that makes auto-approval survivable: what a person never read and
+    nothing ever loaded does not get to stay for free.
+
+    Archived, not deleted -- the directory keeps its contents and its git
+    history, exactly like the curator's own retirements.
+    """
+    expired = pending.expired_trials()
+    if not expired:
+        # Trials that were loaded have passed; stop tracking them.
+        state = pending.read_state()
+        trials = state.get("auto_approved") or {}
+        usage = state.get("usage") or {}
+        passed = [s for s in trials if (usage.get(s) or {}).get("count")]
+        for skill in passed:
+            pending.clear_trial(skill)
+        if passed:
+            review_mod.log({"event": "trial-passed", "skills": passed})
+        return 0
+
+    guard.ensure_skills_repo()
+    retired = []
+    for skill in expired:
+        source = guard.SKILLS_DIR / skill
+        if not source.is_dir():
+            pending.clear_trial(skill)
+            continue
+        target = guard.SKILLS_DIR / pending.ARCHIVE_DIR / skill
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(target, ignore_errors=True)
+        shutil.move(str(source), str(target))
+        guard.commit(
+            f"trial expired: {skill}\n\n"
+            f"Auto-approved and never loaded inside the trial window. "
+            f"Archived, not deleted."
+        )
+        pending.clear_trial(skill)
+        retired.append(skill)
+
+    if retired:
+        review_mod.log({"event": "trial-expired", "skills": retired})
+    return len(retired)
 
 
 # ---------------------------------------------------------------------------

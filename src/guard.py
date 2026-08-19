@@ -144,7 +144,25 @@ DENIED_TOOLS = ["Bash", "WebFetch", "WebSearch", "Task", "Agent", "NotebookEdit"
 #: Hard ceiling per fork, in dollars. Turns and a timeout bound how *long* a
 #: fork runs, not what it costs: a single turn can be arbitrarily expensive, and
 #: a daily sweep multiplies whatever one review costs by its batch size.
+#:
+#: The shared default. Every pass may name its own ceiling instead -- one number
+#: for every fork was simultaneously too low for reflect over a large session
+#: and many times too high for a Haiku compaction, which is how a session that
+#: cost $0.55 to fail became the normal outcome for anything big.
 MAX_BUDGET_USD = env("MAX_USD", "0.50")
+
+#: Per-pass ceilings. Each falls back to ``MAX_BUDGET_USD`` so setting the one
+#: shared variable still works as the single knob it has always been.
+#: Measured, not guessed: compacting the largest session this loop has seen
+#: (123,862 characters of collapsed older turns, down to 3,574) cost $0.108 on
+#: Haiku. A ceiling of $0.10 stopped it one cent short and the review fell back
+#: to truncating, which is the failure this pass exists to prevent. $0.25 leaves
+#: room for a bigger session without leaving room for a runaway.
+COMPACT_MAX_USD = env("COMPACT_MAX_USD", "0.25")
+REFLECT_MAX_USD = env("REFLECT_MAX_USD", MAX_BUDGET_USD)
+#: The expensive pass: it reads the library and the queue before it writes.
+PLACE_MAX_USD = env("PLACE_MAX_USD", "0.75")
+CURATOR_MAX_USD = env("CURATOR_MAX_USD", MAX_BUDGET_USD)
 
 #: Optional. Claude Code falls back when the primary model is overloaded or
 #: unavailable. Unset by default: a quieter model silently producing weaker
@@ -153,28 +171,38 @@ FALLBACK_MODEL = env("FALLBACK_MODEL", "")
 
 
 def fork_command(
-    prompt: str,
+    prompt: Optional[str] = None,
     *,
     model: str,
     max_turns: int,
     add_dirs: Iterable[Path] = (),
     tools: Optional[List[str]] = None,
     schema: Optional[Dict[str, Any]] = None,
+    max_budget_usd: Optional[str] = None,
 ) -> List[str]:
     """Argv for a headless child.
 
     One place, because the two entry points had drifted into near-identical
     twenty-line lists and a flag added to one was a flag missing from the other.
 
+    ``prompt=None`` -- the normal case -- leaves the prompt out of argv entirely
+    so the caller can write it to the child's stdin. Passing it as an argument
+    was a latent size limit: Linux caps a single argv string at
+    ``MAX_ARG_STRLEN`` (131072 bytes), and a digest near its own ceiling plus a
+    prompt template crossed it, raising ``OSError(7)`` before the fork ever
+    started. Nothing bounds stdin. Passing a string here still works, for tests
+    and for anything that wants to read the command back.
+
     ``tools=[]`` means a pass that reads and writes nothing -- it only thinks.
     ``schema`` forces structured output, which is what lets callers branch on
     what the fork decided instead of grepping its prose for a phrase.
+    ``max_budget_usd`` names this pass's ceiling; unset means the shared one.
     """
     allowed = ALLOWED_TOOLS if tools is None else tools
     command = [
         "claude",
         "-p",
-        prompt,
+        *([prompt] if prompt is not None else []),
         "--model",
         model,
         "--settings",
@@ -190,8 +218,9 @@ def fork_command(
         # be taught to ignore it. Not writing one is simpler than excluding it.
         "--no-session-persistence",
     ]
-    if MAX_BUDGET_USD:
-        command += ["--max-budget-usd", str(MAX_BUDGET_USD)]
+    ceiling = max_budget_usd if max_budget_usd is not None else MAX_BUDGET_USD
+    if ceiling:
+        command += ["--max-budget-usd", str(ceiling)]
     if FALLBACK_MODEL:
         command += ["--fallback-model", FALLBACK_MODEL]
     if schema is not None:
